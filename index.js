@@ -459,7 +459,42 @@ function buildQuickReply(text, buttons) {
   };
 }
 
-async function handleOnboarding(event, patient) {
+// ============================================================
+// INTENT CLASSIFIER
+// Uses Haiku to understand natural language in onboarding.
+// Returns a simple intent string so we don't need rigid keywords.
+// ============================================================
+
+async function classifyIntent(text, context) {
+  const prompts = {
+    done_or_more:
+      `User said: "${text}"\nAre they saying they are DONE (finished, no more items, that's all) or do they have MORE items to add? Or are they saying something else entirely?\nReply with exactly one word: DONE, MORE, or OTHER`,
+
+    mode_choice:
+      `User said: "${text}"\nAre they saying they want to use this app for THEMSELVES (self-care, solo) or for a FAMILY member (parent, spouse, someone else)? Or unclear?\nReply with exactly one word: SELF, FAMILY, or UNCLEAR`,
+
+    has_conditions:
+      `User said: "${text}"\nAre they listing medical conditions (blood pressure, diabetes, heart disease etc) or saying they have NONE?\nReply with exactly one word: HAS_CONDITIONS, NO_CONDITIONS, or UNCLEAR`,
+
+    has_meds:
+      `User said: "${text}"\nAre they saying they have medications to list (yes, have meds, want to type or photo) or NO medications?\nReply with exactly one word: HAS_MEDS, NO_MEDS, or UNCLEAR`,
+
+    correct_or_edit:
+      `User said: "${text}"\nAre they confirming the information is CORRECT (yes, right, ok, looks good) or do they want to EDIT something (wrong, fix, change)?\nReply with exactly one word: CORRECT, EDIT, or UNCLEAR`,
+  };
+
+  try {
+    const response = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 10, // just one word needed
+      messages: [{ role: 'user', content: prompts[context] }],
+    });
+    return response.content.find(b => b.type === 'text')?.text?.trim().toUpperCase() || 'UNCLEAR';
+  } catch (err) {
+    console.error('Intent classification failed:', err.message);
+    return 'UNCLEAR';
+  }
+}
   const replyToken = event.replyToken;
   const text = event.message?.text?.trim() || '';
   const patientId = patient.id;
@@ -501,10 +536,9 @@ async function handleOnboarding(event, patient) {
 
   // STATE: asking_mode → set mode, branch
   if (state === 'asking_mode') {
-    const isSolo     = text.includes('ตัวเอง');
-    const isGuardian = text.includes('พ่อแม่') || text.includes('ครอบครัว');
+    const intent = await classifyIntent(text, 'mode_choice');
 
-    if (!isSolo && !isGuardian) {
+    if (intent === 'UNCLEAR') {
       await client.replyMessage({
         replyToken,
         messages: [buildQuickReply('ขอโทษครับ ลุงยังไม่เข้าใจ — เลือกได้เลยครับ:', [
@@ -515,7 +549,7 @@ async function handleOnboarding(event, patient) {
       return;
     }
 
-    if (isGuardian) {
+    if (intent === 'FAMILY') {
       await pool.query(
         `UPDATE households SET mode = 'guardian'
          WHERE id = (SELECT household_id FROM patients WHERE id = $1)`, [patientId]
@@ -548,7 +582,8 @@ async function handleOnboarding(event, patient) {
 
   // STATE: asking_conditions → save, ask meds
   if (state === 'asking_conditions') {
-    const conditions = text === 'ไม่มี' ? null : text;
+    const intent = await classifyIntent(text, 'has_conditions');
+    const conditions = intent === 'NO_CONDITIONS' ? null : text;
     await pool.query(`UPDATE patients SET conditions = $1 WHERE id = $2`, [conditions, patientId]);
     await setOnboardingState(patientId, 'asking_meds');
     await client.replyMessage({
@@ -654,18 +689,22 @@ function parseMedication(text) {
   return { name, dosage, schedule };
 }
 
-async function saveMedication(patientId, text, source = 'chat') {
-  const { name, dosage, schedule } = parseMedication(text);
+function hasTimeInfo(text) {
+  const timeWords = [
+    'เช้า', 'กลางวัน', 'เที่ยง', 'บ่าย', 'เย็น', 'ก่อนนอน', 'นอน', 'กลางคืน', 'ดึก',
+    'วันละ', 'เช้าเย็น', 'สามมื้อ', '3มื้อ',
+  ];
+  const hasExplicitTime = /\b([0-9]{1,2}:[0-9]{2})\b/.test(text);
+  return hasExplicitTime || timeWords.some(w => text.includes(w));
+}
 
-  if (!name || name.length < 2) return null;
-
+async function saveMedicationWithSchedule(patientId, name, dosage, schedule, source = 'chat') {
   const result = await pool.query(
     `INSERT INTO medications (patient_id, name, dosage, schedule, active, source)
      VALUES ($1, $2, $3, $4, TRUE, $5)
      RETURNING id, name, dosage, schedule`,
     [patientId, name, dosage, schedule, source]
   );
-
   console.log(`💊 Medication saved: ${name} ${dosage || ''} @ ${schedule.join(', ')}`);
   return result.rows[0];
 }
@@ -682,7 +721,84 @@ function formatMedConfirmation(med) {
   return `${med.name}${med.dosage ? ` ${med.dosage}` : ''} — ${scheduleLabel}`;
 }
 
-  // STATE: asking_meds → complete onboarding
+// Build a LINE Flex Message card listing all medications
+async function buildMedCard(patientId, headerText = '💊 รายการยาของคุณ') {
+  const result = await pool.query(
+    `SELECT name, dosage, schedule FROM medications
+     WHERE patient_id = $1 AND active = TRUE
+     ORDER BY created_at`,
+    [patientId]
+  );
+
+  const timeLabels = {
+    '08:00': 'เช้า', '12:00': 'กลางวัน', '14:00': 'บ่าย',
+    '18:00': 'เย็น', '21:00': 'ก่อนนอน', '22:00': 'กลางคืน',
+  };
+
+  const rows = result.rows.map(m => {
+    const times = m.schedule.map(t => timeLabels[t] || t).join(', ');
+    const label = `${m.name}${m.dosage ? ` ${m.dosage}` : ''}`;
+    return {
+      type: 'box',
+      layout: 'horizontal',
+      contents: [
+        { type: 'text', text: label, size: 'sm', color: '#1a1a1a', flex: 3, wrap: true },
+        { type: 'text', text: times, size: 'sm', color: '#555555', flex: 2, align: 'end', wrap: true },
+      ],
+      paddingTop: '8px',
+      paddingBottom: '8px',
+      borderWidth: '1px',
+      borderColor: '#eeeeee',
+      cornerRadius: '4px',
+    };
+  });
+
+  return {
+    type: 'flex',
+    altText: headerText,
+    contents: {
+      type: 'bubble',
+      size: 'kilo',
+      header: {
+        type: 'box',
+        layout: 'vertical',
+        contents: [{
+          type: 'text',
+          text: headerText,
+          weight: 'bold',
+          size: 'md',
+          color: '#ffffff',
+        }],
+        backgroundColor: '#06C755',
+        paddingAll: '14px',
+      },
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        contents: rows.length > 0 ? rows : [{
+          type: 'text',
+          text: 'ยังไม่มีรายการยาครับ',
+          size: 'sm',
+          color: '#999999',
+        }],
+        paddingAll: '12px',
+        spacing: 'none',
+      },
+      footer: {
+        type: 'box',
+        layout: 'vertical',
+        contents: [{
+          type: 'text',
+          text: `รวม ${rows.length} รายการ · แจ้งลุงเพื่อแก้ไขได้เลยครับ`,
+          size: 'xs',
+          color: '#aaaaaa',
+          align: 'center',
+        }],
+        paddingAll: '10px',
+      },
+    },
+  };
+}
   if (state === 'asking_meds') {
     const noMeds      = text.includes('ไม่มียา');
     const wantToType  = text.includes('มียา');
@@ -719,8 +835,33 @@ function formatMedConfirmation(med) {
     }
 
     // User typed a med name directly without pressing a button
-    const med = await saveMedication(patientId, text, 'chat');
-    if (med) {
+    const { name, dosage, schedule } = parseMedication(text);
+    if (name && name.length >= 2) {
+      if (!hasTimeInfo(text)) {
+        // No time detected — ask explicitly before saving
+        await pool.query(
+          `UPDATE patients SET pending_med_name = $1, pending_med_dosage = $2 WHERE id = $3`,
+          [name, dosage, patientId]
+        );
+        await setOnboardingState(patientId, 'asking_med_time');
+        await client.replyMessage({
+          replyToken,
+          messages: [buildQuickReply(
+            `${name}${dosage ? ` ${dosage}` : ''} — ทานตอนไหนครับ?`,
+            [
+              { label: '🌅 เช้า',           text: 'เช้า' },
+              { label: '☀️ กลางวัน',        text: 'กลางวัน' },
+              { label: '🌆 เย็น',           text: 'เย็น' },
+              { label: '🌙 ก่อนนอน',        text: 'ก่อนนอน' },
+              { label: '🌅☀️🌆 เช้าเย็น',  text: 'เช้าเย็น' },
+              { label: '3 มื้อ',            text: 'เช้ากลางวันเย็น' },
+            ]
+          )],
+        });
+        return;
+      }
+
+      const med = await saveMedicationWithSchedule(patientId, name, dosage, schedule, 'chat');
       await setOnboardingState(patientId, 'asking_more_meds');
       await client.replyMessage({
         replyToken,
@@ -735,32 +876,80 @@ function formatMedConfirmation(med) {
       return;
     }
 
-    // Could not parse — ask again
+    // Could not parse name — ask again
     await client.replyMessage({
       replyToken,
       messages: [{ type: 'text',
-        text: 'ขอโทษครับ ลุงอ่านไม่ออก ช่วยพิมพ์ชื่อยาใหม่อีกครั้งได้ไหมครับ? เช่น "Amlodipine 5mg กินเช้า"' }],
+        text: 'ขอโทษครับ ลุงอ่านไม่ออก ช่วยพิมพ์ชื่อยาใหม่อีกครั้งได้ไหมครับ? เช่น "Amlodipine 5mg"' }],
+    });
+    return;
+  }
+
+  // STATE: asking_med_time → save med with the chosen time then continue
+  if (state === 'asking_med_time') {
+    const pendingResult = await pool.query(
+      `SELECT pending_med_name, pending_med_dosage FROM patients WHERE id = $1`,
+      [patientId]
+    );
+    const { pending_med_name, pending_med_dosage } = pendingResult.rows[0];
+    const { schedule } = parseMedication(text); // parse the time answer
+    const finalSchedule = schedule.length > 0 ? schedule : ['08:00'];
+
+    const med = await saveMedicationWithSchedule(
+      patientId, pending_med_name, pending_med_dosage, finalSchedule, 'chat'
+    );
+
+    // Clear pending fields
+    await pool.query(
+      `UPDATE patients SET pending_med_name = NULL, pending_med_dosage = NULL WHERE id = $1`,
+      [patientId]
+    );
+    await setOnboardingState(patientId, 'asking_more_meds');
+
+    await client.replyMessage({
+      replyToken,
+      messages: [buildQuickReply(
+        `จดไว้แล้วครับ 💊\n✅ ${formatMedConfirmation(med)}\n\nมียาตัวอื่นอีกไหมครับ?`,
+        [
+          { label: '💊 มียาอีก', text: 'มียาอีก' },
+          { label: '✅ หมดแล้ว', text: 'หมดแล้ว' },
+        ]
+      )],
     });
     return;
   }
 
   // STATE: asking_more_meds → loop for additional meds
   if (state === 'asking_more_meds') {
-    const done = text.includes('หมดแล้ว') || text.includes('ไม่มีแล้ว') || text.includes('เท่านี้');
+    const done = text.includes('หมดแล้ว') || text.includes('ไม่มีแล้ว') || text.includes('เท่านี้') || text.includes('ถูกต้อง') || text.includes('ใช่');
     const more = text.includes('มียาอีก');
+    const notCorrect = text.includes('ไม่ถูก') || text.includes('แก้ไข') || text.includes('ผิด');
 
-    if (done) {
-      await setOnboardingState(patientId, 'complete');
-      // Count how many meds were saved
-      const countResult = await pool.query(
-        `SELECT COUNT(*) FROM medications WHERE patient_id = $1 AND active = TRUE`,
-        [patientId]
-      );
-      const count = parseInt(countResult.rows[0].count);
+    if (notCorrect) {
       await client.replyMessage({
         replyToken,
         messages: [{ type: 'text',
-          text: `เรียบร้อยครับ คุณ${patient.display_name || ''} 🎉\nจดยาไว้ ${count} ตัวแล้วครับ ลุงจะเตือนยาตรงเวลาให้นะครับ ⏰\nบอกค่าความดัน น้ำตาล หรืออาการมาได้เลยครับ` }],
+          text: 'บอกลุงได้เลยครับ ว่าอยากแก้ไขยาตัวไหน หรือเพิ่ม/ลบอะไรครับ?' }],
+      });
+      return;
+    }
+
+    if (done) {
+      await setOnboardingState(patientId, 'complete');
+      // Show Flex card + confirmation
+      const card = await buildMedCard(patientId, '💊 รายการยาที่ลุงจดไว้');
+      await client.replyMessage({
+        replyToken,
+        messages: [
+          card,
+          buildQuickReply(
+            `ข้อมูลยาถูกต้องไหมครับ คุณ${patient.display_name || ''}?\nลุงจะเตือนยาตามเวลาที่จดไว้เลยครับ ⏰`,
+            [
+              { label: '✅ ถูกต้องแล้ว',   text: 'ถูกต้องแล้ว' },
+              { label: '✏️ แก้ไขบางอย่าง', text: 'อยากแก้ไข' },
+            ]
+          ),
+        ],
       });
       return;
     }
@@ -775,8 +964,33 @@ function formatMedConfirmation(med) {
     }
 
     // User typed another med name
-    const med = await saveMedication(patientId, text, 'chat');
-    if (med) {
+    const { name, dosage, schedule } = parseMedication(text);
+    if (name && name.length >= 2) {
+      if (!hasTimeInfo(text)) {
+        // No time — ask before saving
+        await pool.query(
+          `UPDATE patients SET pending_med_name = $1, pending_med_dosage = $2 WHERE id = $3`,
+          [name, dosage, patientId]
+        );
+        await setOnboardingState(patientId, 'asking_med_time');
+        await client.replyMessage({
+          replyToken,
+          messages: [buildQuickReply(
+            `${name}${dosage ? ` ${dosage}` : ''} — ทานตอนไหนครับ?`,
+            [
+              { label: '🌅 เช้า',          text: 'เช้า' },
+              { label: '☀️ กลางวัน',       text: 'กลางวัน' },
+              { label: '🌆 เย็น',          text: 'เย็น' },
+              { label: '🌙 ก่อนนอน',       text: 'ก่อนนอน' },
+              { label: '🌅☀️🌆 เช้าเย็น', text: 'เช้าเย็น' },
+              { label: '3 มื้อ',           text: 'เช้ากลางวันเย็น' },
+            ]
+          )],
+        });
+        return;
+      }
+
+      const med = await saveMedicationWithSchedule(patientId, name, dosage, schedule, 'chat');
       await client.replyMessage({
         replyToken,
         messages: [buildQuickReply(
@@ -794,10 +1008,8 @@ function formatMedConfirmation(med) {
     await client.replyMessage({
       replyToken,
       messages: [buildQuickReply(
-        'ขอโทษครับ ลุงอ่านไม่ออก ช่วยพิมพ์ใหม่ได้ไหมครับ? เช่น "Amlodipine 5mg กินเช้า"',
-        [
-          { label: '✅ หมดแล้ว ไม่มียาอีก', text: 'หมดแล้ว' },
-        ]
+        'ขอโทษครับ ลุงอ่านไม่ออก ช่วยพิมพ์ใหม่ได้ไหมครับ? เช่น "Amlodipine 5mg"',
+        [{ label: '✅ หมดแล้ว ไม่มียาอีก', text: 'หมดแล้ว' }]
       )],
     });
     return;
@@ -886,7 +1098,35 @@ async function handleImageDuringOnboarding(event, patient) {
   }
 }
 
-async function loadHistory(patientId) {
+// Load patient's medications from DB for context injection
+async function loadPatientContext(patientId) {
+  const result = await pool.query(
+    `SELECT name, dosage, schedule FROM medications
+     WHERE patient_id = $1 AND active = TRUE
+     ORDER BY created_at`,
+    [patientId]
+  );
+
+  if (result.rows.length === 0) return '';
+
+  const timeLabels = {
+    '08:00': 'เช้า', '12:00': 'กลางวัน', '14:00': 'บ่าย',
+    '18:00': 'เย็น', '21:00': 'ก่อนนอน', '22:00': 'กลางคืน',
+  };
+
+  const medList = result.rows.map(m => {
+    const times = m.schedule.map(t => timeLabels[t] || t).join(', ');
+    return `- ${m.name}${m.dosage ? ` ${m.dosage}` : ''} (${times})`;
+  }).join('\n');
+
+  return `\n\nยาที่ผู้ใช้ทานประจำ (จากฐานข้อมูล):\n${medList}`;
+}
+
+// Build dynamic system prompt with patient context injected
+async function buildSystemPrompt(patientId) {
+  const patientContext = await loadPatientContext(patientId);
+  return SYSTEM_PROMPT + patientContext;
+}
   const result = await pool.query(
     `SELECT role, content FROM conversation_history
      WHERE patient_id = $1
@@ -1056,6 +1296,21 @@ async function handleEvent(event) {
 async function handleTextMessage(event, patientId) {
   const userMessage = event.message.text;
 
+  // --- Check if user is asking for their medication list ---
+  const medListTriggers = [
+    'รายการยา', 'ยาอะไรบ้าง', 'จดยาอะไร', 'มียาอะไร',
+    'ยาทั้งหมด', 'ยาที่มี', 'ดูยา', 'list ยา', 'ยาของฉัน',
+  ];
+  if (medListTriggers.some(t => userMessage.includes(t))) {
+    const card = await buildMedCard(patientId, '💊 รายการยาของคุณ');
+    await client.replyMessage({
+      replyToken: event.replyToken,
+      messages: [card],
+    });
+    await incrementQuota(patientId, 'message');
+    return; // skip Claude call entirely — no AI needed
+  }
+
   // --- Check for medication confirmation ---
   if (isTakenConfirmation(userMessage)) {
     await pool.query(
@@ -1078,7 +1333,7 @@ async function handleTextMessage(event, patientId) {
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-4-6',
     max_tokens: 300,
-    system: SYSTEM_PROMPT,
+    system: await buildSystemPrompt(patientId),
     messages: history,
   });
 
@@ -1126,7 +1381,7 @@ async function handleImageMessage(event, patientId) {
     const response = await anthropic.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 400,
-      system: SYSTEM_PROMPT,
+      system: await buildSystemPrompt(patientId),
       messages: [
         ...history,
         {
