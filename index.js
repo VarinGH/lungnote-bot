@@ -1076,7 +1076,7 @@ cron.schedule('0 2 * * *', async () => {
        AND m.pills_remaining IS NOT NULL
        AND m.pills_remaining <= m.refill_alert_at
        AND p.line_user_id IS NOT NULL
-       AND r.id IS NULL`,  -- not already notified in last 7 days
+       AND r.id IS NULL`,
       []
     );
 
@@ -1127,6 +1127,124 @@ cron.schedule('0 2 * * *', async () => {
 });
 
 console.log('💊 Refill reminder cron scheduled (09:00 Bangkok)');
+
+// ============================================================
+// APPOINTMENT REMINDER CRON — runs every hour
+// Checks for appointments in the next 48h and 24h
+// Pushes to patient + guardian
+// ============================================================
+
+cron.schedule('0 * * * *', async () => {
+  console.log('📅 Checking appointment reminders...');
+  try {
+    const now = new Date();
+    const bangkokNow = new Date(now.getTime() + 7 * 3600000);
+
+    // Find appointments needing 48h reminder
+    const need48h = await pool.query(
+      `SELECT a.id, a.title, a.appointment_at, a.patient_id,
+              p.line_user_id, p.display_name
+       FROM appointment_reminders a
+       JOIN patients p ON p.id = a.patient_id
+       WHERE a.reminder_48h_sent = FALSE
+       AND a.appointment_at > NOW()
+       AND a.appointment_at <= NOW() + INTERVAL '49 hours'
+       AND a.appointment_at > NOW() + INTERVAL '23 hours'
+       AND p.line_user_id IS NOT NULL`,
+      []
+    );
+
+    for (const appt of need48h.rows) {
+      try {
+        const apptTime = new Date(new Date(appt.appointment_at).getTime() + 7 * 3600000);
+        const timeStr = apptTime.toLocaleString('th-TH', {
+          weekday: 'long', month: 'long', day: 'numeric',
+          hour: '2-digit', minute: '2-digit',
+        });
+        const name = appt.display_name ? ` คุณ${appt.display_name}` : '';
+
+        await client.pushMessage({
+          to: appt.line_user_id,
+          messages: [{ type: 'text',
+            text: `📅 แจ้งเตือนนัดแพทย์${name}ครับ\n${appt.title}\n🕐 ${timeStr}\n\nอีก 2 วันแล้วนะครับ อย่าลืมเตรียมตัวด้วยนะครับ 😊` }],
+        });
+
+        await notifyGuardianAppt(appt, 48);
+        await pool.query(
+          `UPDATE appointment_reminders SET reminder_48h_sent=TRUE WHERE id=$1`,
+          [appt.id]
+        );
+        console.log(`📅 48h reminder sent: ${appt.title}`);
+      } catch (err) { console.error('❌ 48h reminder failed:', err.message); }
+    }
+
+    // Find appointments needing 24h reminder
+    const need24h = await pool.query(
+      `SELECT a.id, a.title, a.appointment_at, a.patient_id,
+              p.line_user_id, p.display_name
+       FROM appointment_reminders a
+       JOIN patients p ON p.id = a.patient_id
+       WHERE a.reminder_24h_sent = FALSE
+       AND a.appointment_at > NOW()
+       AND a.appointment_at <= NOW() + INTERVAL '25 hours'
+       AND a.appointment_at > NOW() + INTERVAL '1 hour'
+       AND p.line_user_id IS NOT NULL`,
+      []
+    );
+
+    for (const appt of need24h.rows) {
+      try {
+        const apptTime = new Date(new Date(appt.appointment_at).getTime() + 7 * 3600000);
+        const timeStr = apptTime.toLocaleString('th-TH', {
+          weekday: 'long', hour: '2-digit', minute: '2-digit',
+        });
+        const name = appt.display_name ? ` คุณ${appt.display_name}` : '';
+
+        await client.pushMessage({
+          to: appt.line_user_id,
+          messages: [{ type: 'text',
+            text: `📅 แจ้งเตือนนัดแพทย์${name}ครับ\n${appt.title}\n🕐 พรุ่งนี้ ${timeStr}\n\nอย่าลืมนะครับ 🏥 และอย่าลืมนำบัตรประชาชน + ประวัติยาไปด้วยครับ` }],
+        });
+
+        await notifyGuardianAppt(appt, 24);
+        await pool.query(
+          `UPDATE appointment_reminders SET reminder_24h_sent=TRUE WHERE id=$1`,
+          [appt.id]
+        );
+        console.log(`📅 24h reminder sent: ${appt.title}`);
+      } catch (err) { console.error('❌ 24h reminder failed:', err.message); }
+    }
+
+  } catch (err) { console.error('❌ Appointment cron:', err.message); }
+});
+
+async function notifyGuardianAppt(appt, hours) {
+  try {
+    const guardian = await pool.query(
+      `SELECT g.line_user_id FROM guardians g
+       JOIN households h ON h.id=g.household_id
+       JOIN patients p ON p.household_id=h.id
+       WHERE p.id=$1 AND g.line_user_id IS NOT NULL`,
+      [appt.patient_id]
+    );
+    if (guardian.rows.length === 0) return;
+
+    const apptTime = new Date(new Date(appt.appointment_at).getTime() + 7 * 3600000);
+    const timeStr = apptTime.toLocaleString('th-TH', {
+      weekday: 'long', month: 'long', day: 'numeric',
+      hour: '2-digit', minute: '2-digit',
+    });
+    const patientLabel = appt.display_name ? `คุณ${appt.display_name}` : 'ผู้ที่คุณดูแล';
+
+    await client.pushMessage({
+      to: guardian.rows[0].line_user_id,
+      messages: [{ type: 'text',
+        text: `📅 แจ้งเตือนจากลุงโน้ต\n${patientLabel} มีนัดแพทย์ใน ${hours} ชั่วโมงครับ\n${appt.title}\n🕐 ${timeStr}` }],
+    });
+  } catch (err) { console.error('❌ Guardian appt notify:', err.message); }
+}
+
+console.log('📅 Appointment reminder cron scheduled (every hour)');
 
 // ============================================================
 // CAREGIVER DASHBOARD — Flex Message card
@@ -1320,8 +1438,45 @@ async function handleEvent(event) {
   else if (event.message.type === 'image') await handleImageMessage(event, patientId);
   else {
     await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text',
-      text: 'ลุงรับเป็นข้อความหรือรูปภาพได้นะครับ' }]});
+      text: 'ลุงรับข้อความหรือรูปภาพได้นะครับ 😊' }]});
   }
+}
+
+// ============================================================
+// APPOINTMENT SLIP PHOTO HANDLER
+// Called when image arrives and context suggests appointment
+// ============================================================
+
+async function handleAppointmentSlipPhoto(imageBase64, patientId, replyToken) {
+  const today = new Date(Date.now() + 7 * 3600000).toISOString().split('T')[0];
+
+  const response = await anthropic.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 200,
+    messages: [{ role: 'user', content: [
+      { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: imageBase64 } },
+      { type: 'text', text:
+        `Today is ${today} (Bangkok). This is a hospital/clinic appointment slip. Extract the appointment info.\nReply ONLY valid JSON: {"title":"hospital or department name","datetime":"YYYY-MM-DDTHH:MM:00","notes":"any other info"}\nIf date/time not found use null.` },
+    ]}],
+  });
+
+  const raw = response.content.find(b => b.type === 'text')?.text ?? '';
+  try {
+    const jm = raw.match(/\{[\s\S]*\}/);
+    if (!jm) return null;
+    const parsed = JSON.parse(jm[0]);
+    if (!parsed.title || !parsed.datetime) return null;
+
+    const apptDate = new Date(new Date(parsed.datetime).getTime() - 7 * 3600000);
+    if (isNaN(apptDate.getTime()) || apptDate < new Date()) return null;
+
+    const title = parsed.notes ? `${parsed.title} (${parsed.notes})` : parsed.title;
+    await pool.query(
+      `INSERT INTO appointment_reminders (patient_id, title, appointment_at) VALUES ($1,$2,$3)`,
+      [patientId, title, apptDate]
+    );
+    return { title, datetime: new Date(parsed.datetime) };
+  } catch (e) { return null; }
 }
 
 // ============================================================
@@ -1333,6 +1488,44 @@ function isTakenConfirmation(text) {
 }
 
 const MED_LIST_TRIGGERS = ['รายการยา','ยาอะไรบ้าง','จดยาอะไร','มียาอะไร','ยาทั้งหมด','ดูยา','ยาของฉัน'];
+
+const APPT_TRIGGERS = ['นัดหมอ','นัดแพทย์','นัด รพ','นัดโรงพยาบาล','นัดคลินิก','จำนัด','บันทึกนัด'];
+
+// Parse appointment date/time from Thai natural language
+async function parseAndSaveAppointment(patientId, text) {
+  // Ask Haiku to extract date + title from the message
+  const today = new Date(Date.now() + 7 * 3600000).toISOString().split('T')[0];
+  const response = await anthropic.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 150,
+    messages: [{ role: 'user', content:
+      `Today is ${today} (Bangkok time). User said: "${text}"\nExtract appointment info. Reply ONLY valid JSON, no other text:\n{"title":"appointment name/place","datetime":"YYYY-MM-DDTHH:MM:00"}\nIf date/time unclear, use null for datetime.`,
+    }],
+  });
+
+  const raw = response.content.find(b => b.type === 'text')?.text ?? '';
+  try {
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    const parsed = JSON.parse(jsonMatch[0]);
+    if (!parsed.title || !parsed.datetime) return null;
+
+    // Convert Bangkok time to UTC for storage
+    const apptDate = new Date(new Date(parsed.datetime).getTime() - 7 * 3600000);
+    if (isNaN(apptDate.getTime()) || apptDate < new Date()) return null;
+
+    await pool.query(
+      `INSERT INTO appointment_reminders (patient_id, title, appointment_at)
+       VALUES ($1, $2, $3)`,
+      [patientId, parsed.title, apptDate]
+    );
+
+    return {
+      title: parsed.title,
+      datetime: new Date(parsed.datetime),
+    };
+  } catch (e) { return null; }
+}
 
 async function handleTextMessage(event, patientId) {
   const userMessage = event.message.text;
@@ -1354,6 +1547,22 @@ async function handleTextMessage(event, patientId) {
     await client.replyMessage({ replyToken: event.replyToken, messages: [card] });
     await incrementQuota(patientId, 'message');
     return;
+  }
+
+  // Appointment booking detection
+  if (APPT_TRIGGERS.some(t => userMessage.includes(t))) {
+    const appt = await parseAndSaveAppointment(patientId, userMessage);
+    if (appt) {
+      const timeStr = appt.datetime.toLocaleString('th-TH', {
+        weekday: 'long', month: 'long', day: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+      });
+      await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text',
+        text: `📅 จดนัดไว้แล้วครับ\n${appt.title}\n🕐 ${timeStr}\n\nลุงจะเตือน 48 ชั่วโมงและ 24 ชั่วโมงก่อนถึงนัดนะครับ 😊` }]});
+      await incrementQuota(patientId, 'message');
+      return;
+    }
+    // Could not parse — let Claude handle it naturally
   }
 
   // Medication taken confirmation
@@ -1417,7 +1626,36 @@ async function handleImageMessage(event, patientId) {
     for await (const chunk of stream) chunks.push(chunk);
     const imageBase64 = Buffer.concat(chunks).toString('base64');
 
-    const history = await loadHistory(patientId);
+    // Check if the previous message was about appointments
+    // If so, try reading as appointment slip first
+    const recentMsg = await pool.query(
+      `SELECT content FROM conversation_history
+       WHERE patient_id=$1 AND role='user'
+       ORDER BY created_at DESC LIMIT 1`,
+      [patientId]
+    );
+    const lastMsg = recentMsg.rows[0]?.content?.toLowerCase() || '';
+    const isApptContext = APPT_TRIGGERS.some(t => lastMsg.includes(t)) ||
+      lastMsg.includes('นัด') || lastMsg.includes('slip') || lastMsg.includes('ใบนัด');
+
+    if (isApptContext) {
+      const appt = await handleAppointmentSlipPhoto(imageBase64, patientId, event.replyToken);
+      if (appt) {
+        const timeStr = appt.datetime.toLocaleString('th-TH', {
+          weekday: 'long', month: 'long', day: 'numeric',
+          hour: '2-digit', minute: '2-digit',
+        });
+        await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text',
+          text: `📅 อ่านใบนัดได้แล้วครับ\n${appt.title}\n🕐 ${timeStr}\nลุงจะเตือน 48 และ 24 ชั่วโมงก่อนถึงนัดนะครับ 😊` }]});
+        await saveMessage(patientId, 'user', '[ส่งรูปใบนัดแพทย์]', 'image_summary');
+        await saveMessage(patientId, 'assistant', `จดนัด ${appt.title} ${timeStr}`, 'text');
+        await incrementQuota(patientId, 'photo');
+        return;
+      }
+      // If appointment parsing failed, fall through to normal image handling
+    }
+
+
     const response = await anthropic.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 400,
