@@ -1358,10 +1358,23 @@ async function handleTextMessage(event, patientId) {
 
   // Medication taken confirmation
   if (isTakenConfirmation(userMessage)) {
-    await pool.query(
-      `UPDATE medication_logs SET status='taken', responded_at=NOW() WHERE patient_id=$1 AND status='missed' AND scheduled_at>NOW()-INTERVAL '2 hours'`,
+    const takenResult = await pool.query(
+      `UPDATE medication_logs SET status='taken', responded_at=NOW()
+       WHERE patient_id=$1 AND status='missed'
+       AND scheduled_at > NOW() - INTERVAL '2 hours'
+       RETURNING medication_id`,
       [patientId]
     );
+    // Decrement pills_remaining for each confirmed dose
+    for (const row of takenResult.rows) {
+      await pool.query(
+        `UPDATE medications
+         SET pills_remaining = GREATEST(pills_remaining - 1, 0)
+         WHERE id=$1 AND pills_remaining IS NOT NULL`,
+        [row.medication_id]
+      );
+    }
+    medCache.delete(patientId); // refresh cache so pill count stays current
   }
 
   // Health reading detection
