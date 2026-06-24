@@ -309,23 +309,103 @@ async function saveHealthLog(patientId, reading, source = 'chat') {
   const logId = result.rows[0].id;
   console.log(`✅ Health log saved: ${reading.type} ${reading.value_1} [${reading.alert_level}]`);
 
-  // If abnormal, create an alert record
-  if (reading.alert_level !== 'normal') {
-    await pool.query(
+  // If abnormal, create an alert record and notify guardian
+  if (reading.alert_level !== 'normal' && reading.alert_level !== 'pending') {
+    const alertResult = await pool.query(
       `INSERT INTO alerts
          (health_log_id, patient_id, type, severity, guardian_notified)
-       VALUES ($1, $2, $3, $4, FALSE)`,
+       VALUES ($1, $2, $3, $4, FALSE)
+       RETURNING id`,
       [logId, patientId, `${reading.alert_level}_${reading.type}`, reading.alert_level]
     );
+    const alertId = alertResult.rows[0].id;
     console.log(`🚨 Alert created: ${reading.type} ${reading.alert_level} for patient ${patientId}`);
+
+    // Push to guardian (non-blocking — runs in background)
+    notifyGuardian(patientId, reading, alertId);
   }
 
   return { logId, alertLevel: reading.alert_level, weightChangeMsg };
 }
 
 // ============================================================
-// DATABASE HELPERS
+// CAREGIVER ALERTS
+// Push guardian when a reading is watch or urgent
 // ============================================================
+
+async function notifyGuardian(patientId, reading, alertId) {
+  try {
+    // Find guardian for this patient's household
+    const result = await pool.query(
+      `SELECT g.line_user_id, g.display_name, g.notification_level,
+              p.display_name as patient_name
+       FROM guardians g
+       JOIN households h ON h.id = g.household_id
+       JOIN patients p ON p.household_id = h.id
+       WHERE p.id = $1
+       AND g.line_user_id IS NOT NULL`,
+      [patientId]
+    );
+
+    if (result.rows.length === 0) return; // Solo mode — no guardian to notify
+
+    const guardian = result.rows[0];
+
+    // Respect notification_level preference
+    if (
+      guardian.notification_level === 'summary_only' ||
+      (guardian.notification_level === 'daily' && reading.alert_level === 'watch')
+    ) return;
+
+    const patientLabel = guardian.patient_name
+      ? `คุณ${guardian.patient_name}`
+      : 'ผู้ที่คุณดูแล';
+
+    const emoji = reading.alert_level === 'urgent' ? '🚨' : '⚠️';
+    const urgencyLabel = reading.alert_level === 'urgent'
+      ? 'ค่าผิดปกติ — ควรพบแพทย์โดยเร็ว'
+      : 'ค่าที่ควรติดตาม';
+
+    // Format the reading value clearly
+    let readingText = '';
+    if (reading.type === 'bp') {
+      readingText = `ความดัน ${reading.value_1}/${reading.value_2} mmHg`;
+    } else if (reading.type === 'glucose') {
+      readingText = `น้ำตาล ${reading.value_1} mg/dL`;
+    } else if (reading.type === 'spo2') {
+      readingText = `ออกซิเจน ${reading.value_1}%${reading.value_2 ? ` ชีพจร ${reading.value_2} ครั้ง/นาที` : ''}`;
+    } else if (reading.type === 'temp') {
+      readingText = `อุณหภูมิ ${reading.value_1}°C`;
+    } else if (reading.type === 'weight') {
+      const change = reading.value_2
+        ? ` (${reading.value_2 > 0 ? '+' : ''}${reading.value_2} กก)`
+        : '';
+      readingText = `น้ำหนัก ${reading.value_1} กก${change}`;
+    }
+
+    const message =
+      `${emoji} แจ้งเตือนจากลุงโน้ต\n` +
+      `${patientLabel}: ${readingText}\n` +
+      `${urgencyLabel}ครับ`;
+
+    await client.pushMessage({
+      to: guardian.line_user_id,
+      messages: [{ type: 'text', text: message }],
+    });
+
+    // Mark alert as notified
+    await pool.query(
+      `UPDATE alerts SET guardian_notified = TRUE WHERE id = $1`,
+      [alertId]
+    );
+
+    console.log(`📲 Guardian notified: ${reading.type} ${reading.alert_level} → ${guardian.line_user_id}`);
+
+  } catch (err) {
+    console.error('❌ Guardian notification failed:', err.message);
+    // Non-fatal — don't let alert failure break the bot
+  }
+}
 
 async function getOrCreatePatient(lineUserId) {
   const existing = await pool.query(
