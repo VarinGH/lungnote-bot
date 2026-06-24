@@ -359,7 +359,7 @@ async function notifyGuardian(patientId, reading, alertId) {
 
     const patientLabel = guardian.patient_name
       ? `คุณ${guardian.patient_name}`
-      : 'ผู้ที่คุณดูแล';
+      : `ผู้ใช้ ...${patientId.slice(-6)}`; // fallback to last 6 chars of patient UUID
 
     const emoji = reading.alert_level === 'urgent' ? '🚨' : '⚠️';
     const urgencyLabel = reading.alert_level === 'urgent'
@@ -414,14 +414,15 @@ async function getOrCreatePatient(lineUserId) {
   );
   if (existing.rows.length > 0) return existing.rows[0];
 
+  // Brand new user — create household + patient in 'new' onboarding state
   const hhResult = await pool.query(
     `INSERT INTO households (mode) VALUES ('solo') RETURNING id`
   );
   const householdId = hhResult.rows[0].id;
 
   const patientResult = await pool.query(
-    `INSERT INTO patients (household_id, line_user_id, care_mode)
-     VALUES ($1, $2, 'self') RETURNING *`,
+    `INSERT INTO patients (household_id, line_user_id, care_mode, onboarding_state)
+     VALUES ($1, $2, 'self', 'new') RETURNING *`,
     [householdId, lineUserId]
   );
 
@@ -432,6 +433,167 @@ async function getOrCreatePatient(lineUserId) {
 
   console.log(`✅ New patient created: ${patientResult.rows[0].id}`);
   return patientResult.rows[0];
+}
+
+function needsOnboarding(patient) {
+  return !patient.onboarding_state || patient.onboarding_state !== 'complete';
+}
+
+async function setOnboardingState(patientId, state) {
+  await pool.query(
+    `UPDATE patients SET onboarding_state = $1 WHERE id = $2`,
+    [state, patientId]
+  );
+}
+
+function buildQuickReply(text, buttons) {
+  return {
+    type: 'text',
+    text,
+    quickReply: {
+      items: buttons.map(b => ({
+        type: 'action',
+        action: { type: 'message', label: b.label, text: b.text || b.label },
+      })),
+    },
+  };
+}
+
+async function handleOnboarding(event, patient) {
+  const replyToken = event.replyToken;
+  const text = event.message?.text?.trim() || '';
+  const patientId = patient.id;
+  const state = patient.onboarding_state || 'new';
+
+  // STATE: new → greet and ask name
+  if (state === 'new') {
+    await setOnboardingState(patientId, 'asking_name');
+    await client.replyMessage({
+      replyToken,
+      messages: [{ type: 'text', text: 'สวัสดีครับ ผมลุงโน้ต ผู้ช่วยดูแลสุขภาพครับ 😊\nขอทราบชื่อของคุณด้วยได้ไหมครับ? (พิมพ์ชื่อได้เลยครับ)' }],
+    });
+    return;
+  }
+
+  // STATE: asking_name → save name, ask mode
+  if (state === 'asking_name') {
+    if (!text || text.length < 1) {
+      await client.replyMessage({
+        replyToken,
+        messages: [{ type: 'text', text: 'ขอโทษครับ ลุงยังไม่ได้ยินชื่อ ช่วยพิมพ์ชื่อมาอีกครั้งได้ไหมครับ?' }],
+      });
+      return;
+    }
+    await pool.query(`UPDATE patients SET display_name = $1 WHERE id = $2`, [text, patientId]);
+    await setOnboardingState(patientId, 'asking_mode');
+    await client.replyMessage({
+      replyToken,
+      messages: [buildQuickReply(
+        `ยินดีที่ได้รู้จักคุณ${text}ครับ 😊\n\nลุงโน้ตจะดูแลใครครับ?`,
+        [
+          { label: '🧓 ดูแลตัวเอง',           text: 'ดูแลตัวเอง' },
+          { label: '👨‍👩‍👧 ดูแลคุณพ่อคุณแม่',  text: 'ดูแลพ่อแม่' },
+        ]
+      )],
+    });
+    return;
+  }
+
+  // STATE: asking_mode → set mode, branch
+  if (state === 'asking_mode') {
+    const isSolo     = text.includes('ตัวเอง');
+    const isGuardian = text.includes('พ่อแม่') || text.includes('ครอบครัว');
+
+    if (!isSolo && !isGuardian) {
+      await client.replyMessage({
+        replyToken,
+        messages: [buildQuickReply('ขอโทษครับ ลุงยังไม่เข้าใจ — เลือกได้เลยครับ:', [
+          { label: '🧓 ดูแลตัวเอง',           text: 'ดูแลตัวเอง' },
+          { label: '👨‍👩‍👧 ดูแลคุณพ่อคุณแม่',  text: 'ดูแลพ่อแม่' },
+        ])],
+      });
+      return;
+    }
+
+    if (isGuardian) {
+      await pool.query(
+        `UPDATE households SET mode = 'guardian'
+         WHERE id = (SELECT household_id FROM patients WHERE id = $1)`, [patientId]
+      );
+      await pool.query(`UPDATE patients SET care_mode = 'family' WHERE id = $1`, [patientId]);
+      await setOnboardingState(patientId, 'complete');
+      await client.replyMessage({
+        replyToken,
+        messages: [{ type: 'text', text: 'ดีมากเลยครับที่ดูแลคุณพ่อคุณแม่ 🙏\nระบบเชิญสมาชิกกำลังพัฒนาอยู่ครับ เร็ว ๆ นี้จะใช้ได้เลยครับ ตอนนี้ใช้งานบอทได้ปกติก่อนเลยนะครับ' }],
+      });
+      return;
+    }
+
+    // Solo → ask conditions
+    await setOnboardingState(patientId, 'asking_conditions');
+    await client.replyMessage({
+      replyToken,
+      messages: [buildQuickReply(
+        'รับทราบครับ 😊 ขอถามนิดนึงนะครับ — มีโรคประจำตัวไหมครับ?',
+        [
+          { label: '❤️ ความดัน',        text: 'ความดัน' },
+          { label: '🩸 เบาหวาน',        text: 'เบาหวาน' },
+          { label: '❤️🩸 ทั้งสองอย่าง', text: 'ความดันและเบาหวาน' },
+          { label: '✨ ไม่มี',           text: 'ไม่มี' },
+        ]
+      )],
+    });
+    return;
+  }
+
+  // STATE: asking_conditions → save, ask meds
+  if (state === 'asking_conditions') {
+    const conditions = text === 'ไม่มี' ? null : text;
+    await pool.query(`UPDATE patients SET conditions = $1 WHERE id = $2`, [conditions, patientId]);
+    await setOnboardingState(patientId, 'asking_meds');
+    await client.replyMessage({
+      replyToken,
+      messages: [buildQuickReply(
+        'รับทราบครับ 👍\nตอนนี้ทานยาประจำอยู่ไหมครับ? ถ้ามีบอกชื่อยามาได้เลย หรือถ่ายรูปฉลากยาส่งมาก็ได้ครับ 💊',
+        [
+          { label: '💊 มียา — พิมพ์บอกลุง', text: 'มียา' },
+          { label: '📷 ถ่ายรูปฉลากยา',      text: 'ถ่ายรูปยา' },
+          { label: '🚫 ไม่มียา',             text: 'ไม่มียา' },
+        ]
+      )],
+    });
+    return;
+  }
+
+  // STATE: asking_meds → complete onboarding
+  if (state === 'asking_meds') {
+    const noMeds  = text.includes('ไม่มียา');
+    const hasMeds = text.includes('มียา') || text.includes('ถ่ายรูปยา');
+
+    await setOnboardingState(patientId, 'complete');
+
+    if (noMeds) {
+      await client.replyMessage({
+        replyToken,
+        messages: [{ type: 'text', text: `เรียบร้อยครับ คุณ${patient.display_name || ''} 🎉\nลุงโน้ตพร้อมดูแลแล้วครับ! บอกค่าความดัน น้ำตาล หรืออาการมาได้เลยนะครับ` }],
+      });
+      return;
+    }
+
+    if (hasMeds) {
+      await client.replyMessage({
+        replyToken,
+        messages: [{ type: 'text', text: 'พิมพ์ชื่อยามาได้เลยครับ เช่น "Amlodipine 5mg กินเช้า" แล้วลุงจะจดไว้ให้ครับ 📝' }],
+      });
+      return;
+    }
+
+    // User typed a med name directly
+    await client.replyMessage({
+      replyToken,
+      messages: [{ type: 'text', text: `รับทราบครับ จดยาไว้แล้วนะครับ 💊\nลุงโน้ตพร้อมดูแลคุณ${patient.display_name || ''}แล้วครับ! 😊` }],
+    });
+  }
 }
 
 async function loadHistory(patientId) {
@@ -568,6 +730,12 @@ async function handleEvent(event) {
   const lineUserId = event.source.userId;
   const patient = await getOrCreatePatient(lineUserId);
   const patientId = patient.id;
+
+  // Route to onboarding if not complete
+  if (needsOnboarding(patient) && event.message.type === 'text') {
+    await handleOnboarding(event, patient);
+    return;
+  }
 
   if (event.message.type === 'text') {
     await handleTextMessage(event, patientId);
