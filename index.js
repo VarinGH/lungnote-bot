@@ -3,6 +3,7 @@ import express from 'express';
 import * as line from '@line/bot-sdk';
 import Anthropic from '@anthropic-ai/sdk';
 import pg from 'pg';
+import cron from 'node-cron';
 
 const { Pool } = pg;
 
@@ -32,10 +33,8 @@ const blobClient = new line.messagingApi.MessagingApiBlobClient({
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
 });
 
-// --- Anthropic configuration ---
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-});
+// --- Anthropic ---
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const app = express();
 
@@ -76,8 +75,7 @@ async function getOrCreatePatient(lineUserId) {
   );
 
   await pool.query(
-    `INSERT INTO subscriptions (household_id, status)
-     VALUES ($1, 'trial')`,
+    `INSERT INTO subscriptions (household_id, status) VALUES ($1, 'trial')`,
     [householdId]
   );
 
@@ -93,10 +91,7 @@ async function loadHistory(patientId) {
      LIMIT 10`,
     [patientId]
   );
-  return result.rows.reverse().map(row => ({
-    role: row.role,
-    content: row.content,
-  }));
+  return result.rows.reverse().map(r => ({ role: r.role, content: r.content }));
 }
 
 async function saveMessage(patientId, role, content, contentType = 'text') {
@@ -105,7 +100,7 @@ async function saveMessage(patientId, role, content, contentType = 'text') {
      VALUES ($1, $2, $3, $4)`,
     [patientId, role, contentType, content]
   );
-
+  // Keep only last 20 rows per patient
   await pool.query(
     `DELETE FROM conversation_history
      WHERE patient_id = $1
@@ -126,6 +121,117 @@ async function incrementQuota(patientId, type) {
     console.error('Quota increment failed:', err.message);
   }
 }
+
+// ============================================================
+// SCHEDULER HELPERS
+// ============================================================
+
+// Find all medications due at the current HH:MM (Bangkok time)
+async function getMedicationsDue() {
+  // Get current time in Bangkok (UTC+7)
+  const now = new Date();
+  const bangkokTime = new Date(now.getTime() + 7 * 60 * 60 * 1000);
+  const hours = String(bangkokTime.getUTCHours()).padStart(2, '0');
+  const minutes = String(bangkokTime.getUTCMinutes()).padStart(2, '0');
+  const currentTime = `${hours}:${minutes}`;
+
+  // Find active medications whose schedule array contains the current time
+  // Also join patients to get the LINE user ID for pushing
+  const result = await pool.query(
+    `SELECT m.id as medication_id, m.name, m.dosage, m.schedule,
+            p.id as patient_id, p.line_user_id, p.display_name
+     FROM medications m
+     JOIN patients p ON p.id = m.patient_id
+     WHERE m.active = TRUE
+     AND p.line_user_id IS NOT NULL
+     AND $1 = ANY(m.schedule)`,
+    [currentTime]
+  );
+  return result.rows;
+}
+
+// Log a medication reminder as "pending" — updated later when user responds
+async function logMedicationReminder(medicationId, patientId, scheduledAt) {
+  const result = await pool.query(
+    `INSERT INTO medication_logs (medication_id, patient_id, status, scheduled_at)
+     VALUES ($1, $2, 'missed', $3)
+     RETURNING id`,
+    [medicationId, patientId, scheduledAt]
+  );
+  return result.rows[0].id;
+}
+
+// Update a medication log to "taken" when user confirms
+async function markMedicationTaken(patientId, medicationName) {
+  // Find the most recent 'missed' log for this patient's medication
+  await pool.query(
+    `UPDATE medication_logs
+     SET status = 'taken', responded_at = NOW()
+     WHERE patient_id = $1
+     AND status = 'missed'
+     AND medication_id IN (
+       SELECT id FROM medications
+       WHERE patient_id = $1
+       AND LOWER(name) LIKE LOWER($2)
+     )
+     AND scheduled_at > NOW() - INTERVAL '2 hours'`,
+    [patientId, `%${medicationName}%`]
+  );
+}
+
+// Detect if a user message means "I took my medication"
+function isTakenConfirmation(text) {
+  const taken = [
+    'กินแล้ว', 'ทานแล้ว', 'กินยาแล้ว', 'ทานยาแล้ว',
+    'โอเค', 'ok', 'ตกลง', 'รับทราบ', '✅', '👍',
+    'เรียบร้อย', 'done', 'เสร็จแล้ว',
+  ];
+  return taken.some(word => text.toLowerCase().includes(word));
+}
+
+// ============================================================
+// THE SCHEDULER — runs every minute
+// ============================================================
+
+cron.schedule('* * * * *', async () => {
+  try {
+    const meds = await getMedicationsDue();
+    if (meds.length === 0) return;
+
+    console.log(`⏰ Scheduler: ${meds.length} medication(s) due now`);
+
+    for (const med of meds) {
+      try {
+        const patientName = med.display_name ? `คุณ${med.display_name}` : 'ครับ';
+        const message =
+          `💊 ถึงเวลากินยาแล้ว${patientName !== 'ครับ' ? ' ' + patientName : ''}ครับ\n` +
+          `ยา: ${med.name}${med.dosage ? ` ${med.dosage}` : ''}\n` +
+          `กินเสร็จแล้วตอบ "กินแล้ว" ให้ลุงทราบด้วยนะครับ 🙏`;
+
+        // Push the reminder (this is a paid LINE push message)
+        await client.pushMessage({
+          to: med.line_user_id,
+          messages: [{ type: 'text', text: message }],
+        });
+
+        // Log it as "missed" initially — updated to "taken" if user confirms
+        await logMedicationReminder(
+          med.medication_id,
+          med.patient_id,
+          new Date()
+        );
+
+        console.log(`✅ Reminder sent: ${med.name} → ${med.line_user_id}`);
+      } catch (err) {
+        console.error(`❌ Failed to send reminder for ${med.name}:`, err.message);
+      }
+    }
+  } catch (err) {
+    console.error('❌ Scheduler error:', err.message);
+  }
+});
+
+console.log('⏰ Medication reminder scheduler started (checks every minute)');
 
 // ============================================================
 // WEBHOOK
@@ -170,6 +276,20 @@ async function handleEvent(event) {
 
 async function handleTextMessage(event, patientId) {
   const userMessage = event.message.text;
+
+  // Check if user is confirming they took their medication
+  if (isTakenConfirmation(userMessage)) {
+    // Mark the most recent pending medication as taken
+    await pool.query(
+      `UPDATE medication_logs
+       SET status = 'taken', responded_at = NOW()
+       WHERE patient_id = $1
+       AND status = 'missed'
+       AND scheduled_at > NOW() - INTERVAL '2 hours'`,
+      [patientId]
+    );
+  }
+
   const history = await loadHistory(patientId);
   history.push({ role: 'user', content: userMessage });
 
@@ -248,7 +368,7 @@ async function handleImageMessage(event, patientId) {
       replyToken: event.replyToken,
       messages: [{
         type: 'text',
-        text: 'ขอโทษครับ ลุงอ่านรูปไม่ค่อยออก ช่วยถ่ายใหม่ให้ชัด ๆ อีกครั้งได้เลยครับ',
+        text: 'ขอโทษครับ ลุงอ่านรูปไม่ค่อยออก ช่วยถ่ายใหม่ให้ชัด ๆ อีกครั้งได้ไหมครับ',
       }],
     });
   }
