@@ -565,33 +565,323 @@ async function handleOnboarding(event, patient) {
     return;
   }
 
+// ============================================================
+// MEDICATION PARSER
+// Extracts name, dosage, and schedule times from natural text
+// ============================================================
+
+function parseMedication(text) {
+  // --- Schedule time mapping ---
+  const timeMap = {
+    'เช้า':       '08:00',
+    'กลางวัน':    '12:00',
+    'เที่ยง':     '12:00',
+    'บ่าย':       '14:00',
+    'เย็น':       '18:00',
+    'ก่อนนอน':   '21:00',
+    'นอน':        '21:00',
+    'กลางคืน':   '21:00',
+    'ดึก':        '22:00',
+  };
+
+  // Shorthand patterns → multiple times
+  const shorthand = {
+    'วันละครั้ง':         ['08:00'],
+    'วันละ1ครั้ง':        ['08:00'],
+    'วันละ 1 ครั้ง':      ['08:00'],
+    'เช้าเย็น':           ['08:00', '18:00'],
+    'เช้ากลางวันเย็น':    ['08:00', '12:00', '18:00'],
+    'เช้า กลางวัน เย็น':  ['08:00', '12:00', '18:00'],
+    'สามมื้อ':            ['08:00', '12:00', '18:00'],
+    '3มื้อ':              ['08:00', '12:00', '18:00'],
+    'เช้าเย็นก่อนนอน':   ['08:00', '18:00', '21:00'],
+  };
+
+  // Build schedule array
+  let schedule = [];
+
+  // Check shorthand first
+  for (const [pattern, times] of Object.entries(shorthand)) {
+    if (text.includes(pattern)) {
+      schedule = times;
+      break;
+    }
+  }
+
+  // If no shorthand, scan for individual time keywords
+  if (schedule.length === 0) {
+    for (const [word, time] of Object.entries(timeMap)) {
+      if (text.includes(word) && !schedule.includes(time)) {
+        schedule.push(time);
+      }
+    }
+  }
+
+  // Check for explicit HH:MM times e.g. "08:00" "9:30"
+  const explicitTimes = text.match(/\b([0-9]{1,2}:[0-9]{2})\b/g);
+  if (explicitTimes) {
+    explicitTimes.forEach(t => {
+      const padded = t.padStart(5, '0');
+      if (!schedule.includes(padded)) schedule.push(padded);
+    });
+  }
+
+  // Default to morning if no time detected at all
+  if (schedule.length === 0) schedule = ['08:00'];
+
+  // Sort schedule chronologically
+  schedule.sort();
+
+  // --- Extract dosage: look for number + unit ---
+  const dosageMatch = text.match(/(\d+(?:\.\d+)?)\s*(mg|mcg|ml|เม็ด|แคปซูล|ช้อน|ซีซี)/i);
+  const dosage = dosageMatch ? `${dosageMatch[1]}${dosageMatch[2]}` : null;
+
+  // --- Extract medication name ---
+  // Remove dosage, schedule keywords, and common Thai filler words
+  let name = text
+    .replace(/\d+(?:\.\d+)?\s*(mg|mcg|ml|เม็ด|แคปซูล|ช้อน|ซีซี)/gi, '')
+    .replace(/วันละ\s*\d+\s*ครั้ง/g, '')
+    .replace(/กิน|ทาน|รับประทาน|ยา/g, '')
+    .replace(new RegExp(Object.keys(shorthand).join('|'), 'g'), '')
+    .replace(new RegExp(Object.keys(timeMap).join('|'), 'g'), '')
+    .replace(/\b([0-9]{1,2}:[0-9]{2})\b/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  // If name is empty after stripping, use the original text truncated
+  if (!name || name.length < 2) name = text.split(' ')[0];
+
+  return { name, dosage, schedule };
+}
+
+async function saveMedication(patientId, text, source = 'chat') {
+  const { name, dosage, schedule } = parseMedication(text);
+
+  if (!name || name.length < 2) return null;
+
+  const result = await pool.query(
+    `INSERT INTO medications (patient_id, name, dosage, schedule, active, source)
+     VALUES ($1, $2, $3, $4, TRUE, $5)
+     RETURNING id, name, dosage, schedule`,
+    [patientId, name, dosage, schedule, source]
+  );
+
+  console.log(`💊 Medication saved: ${name} ${dosage || ''} @ ${schedule.join(', ')}`);
+  return result.rows[0];
+}
+
+// Format saved medication for confirmation message
+function formatMedConfirmation(med) {
+  const timeLabels = {
+    '08:00': 'เช้า', '12:00': 'กลางวัน', '14:00': 'บ่าย',
+    '18:00': 'เย็น', '21:00': 'ก่อนนอน', '22:00': 'กลางคืน',
+  };
+  const scheduleLabel = med.schedule
+    .map(t => timeLabels[t] || t)
+    .join(', ');
+  return `${med.name}${med.dosage ? ` ${med.dosage}` : ''} — ${scheduleLabel}`;
+}
+
   // STATE: asking_meds → complete onboarding
   if (state === 'asking_meds') {
-    const noMeds  = text.includes('ไม่มียา');
-    const hasMeds = text.includes('มียา') || text.includes('ถ่ายรูปยา');
-
-    await setOnboardingState(patientId, 'complete');
+    const noMeds      = text.includes('ไม่มียา');
+    const wantToType  = text.includes('มียา');
+    const wantPhoto   = text.includes('ถ่ายรูปยา');
 
     if (noMeds) {
+      await setOnboardingState(patientId, 'complete');
       await client.replyMessage({
         replyToken,
-        messages: [{ type: 'text', text: `เรียบร้อยครับ คุณ${patient.display_name || ''} 🎉\nลุงโน้ตพร้อมดูแลแล้วครับ! บอกค่าความดัน น้ำตาล หรืออาการมาได้เลยนะครับ` }],
+        messages: [{ type: 'text',
+          text: `เรียบร้อยครับ คุณ${patient.display_name || ''} 🎉\nลุงโน้ตพร้อมดูแลแล้วครับ! บอกค่าความดัน น้ำตาล หรืออาการมาได้เลยนะครับ` }],
       });
       return;
     }
 
-    if (hasMeds) {
+    if (wantPhoto) {
+      await setOnboardingState(patientId, 'asking_more_meds');
       await client.replyMessage({
         replyToken,
-        messages: [{ type: 'text', text: 'พิมพ์ชื่อยามาได้เลยครับ เช่น "Amlodipine 5mg กินเช้า" แล้วลุงจะจดไว้ให้ครับ 📝' }],
+        messages: [{ type: 'text',
+          text: 'ถ่ายรูปฉลากยามาได้เลยครับ ลุงจะอ่านและจดไว้ให้ครับ 📷' }],
       });
       return;
     }
 
-    // User typed a med name directly
+    if (wantToType) {
+      await setOnboardingState(patientId, 'asking_more_meds');
+      await client.replyMessage({
+        replyToken,
+        messages: [{ type: 'text',
+          text: 'พิมพ์ชื่อยามาได้เลยครับ เช่น\n"Amlodipine 5mg กินเช้า"\n"metformin 500mg เช้าเย็น"\nบอกทีละตัวก็ได้ครับ 💊' }],
+      });
+      return;
+    }
+
+    // User typed a med name directly without pressing a button
+    const med = await saveMedication(patientId, text, 'chat');
+    if (med) {
+      await setOnboardingState(patientId, 'asking_more_meds');
+      await client.replyMessage({
+        replyToken,
+        messages: [buildQuickReply(
+          `จดไว้แล้วครับ 💊\n✅ ${formatMedConfirmation(med)}\n\nมียาตัวอื่นอีกไหมครับ?`,
+          [
+            { label: '💊 มียาอีก', text: 'มียาอีก' },
+            { label: '✅ หมดแล้ว', text: 'หมดแล้ว' },
+          ]
+        )],
+      });
+      return;
+    }
+
+    // Could not parse — ask again
     await client.replyMessage({
       replyToken,
-      messages: [{ type: 'text', text: `รับทราบครับ จดยาไว้แล้วนะครับ 💊\nลุงโน้ตพร้อมดูแลคุณ${patient.display_name || ''}แล้วครับ! 😊` }],
+      messages: [{ type: 'text',
+        text: 'ขอโทษครับ ลุงอ่านไม่ออก ช่วยพิมพ์ชื่อยาใหม่อีกครั้งได้ไหมครับ? เช่น "Amlodipine 5mg กินเช้า"' }],
+    });
+    return;
+  }
+
+  // STATE: asking_more_meds → loop for additional meds
+  if (state === 'asking_more_meds') {
+    const done = text.includes('หมดแล้ว') || text.includes('ไม่มีแล้ว') || text.includes('เท่านี้');
+    const more = text.includes('มียาอีก');
+
+    if (done) {
+      await setOnboardingState(patientId, 'complete');
+      // Count how many meds were saved
+      const countResult = await pool.query(
+        `SELECT COUNT(*) FROM medications WHERE patient_id = $1 AND active = TRUE`,
+        [patientId]
+      );
+      const count = parseInt(countResult.rows[0].count);
+      await client.replyMessage({
+        replyToken,
+        messages: [{ type: 'text',
+          text: `เรียบร้อยครับ คุณ${patient.display_name || ''} 🎉\nจดยาไว้ ${count} ตัวแล้วครับ ลุงจะเตือนยาตรงเวลาให้นะครับ ⏰\nบอกค่าความดัน น้ำตาล หรืออาการมาได้เลยครับ` }],
+      });
+      return;
+    }
+
+    if (more) {
+      await client.replyMessage({
+        replyToken,
+        messages: [{ type: 'text',
+          text: 'พิมพ์ชื่อยาตัวต่อไปได้เลยครับ 💊' }],
+      });
+      return;
+    }
+
+    // User typed another med name
+    const med = await saveMedication(patientId, text, 'chat');
+    if (med) {
+      await client.replyMessage({
+        replyToken,
+        messages: [buildQuickReply(
+          `จดไว้แล้วครับ 💊\n✅ ${formatMedConfirmation(med)}\n\nมียาตัวอื่นอีกไหมครับ?`,
+          [
+            { label: '💊 มียาอีก', text: 'มียาอีก' },
+            { label: '✅ หมดแล้ว', text: 'หมดแล้ว' },
+          ]
+        )],
+      });
+      return;
+    }
+
+    // Parse failed
+    await client.replyMessage({
+      replyToken,
+      messages: [buildQuickReply(
+        'ขอโทษครับ ลุงอ่านไม่ออก ช่วยพิมพ์ใหม่ได้ไหมครับ? เช่น "Amlodipine 5mg กินเช้า"',
+        [
+          { label: '✅ หมดแล้ว ไม่มียาอีก', text: 'หมดแล้ว' },
+        ]
+      )],
+    });
+    return;
+  }
+}
+
+// Handle photo of medicine label during onboarding
+async function handleImageDuringOnboarding(event, patient) {
+  try {
+    const stream = await blobClient.getMessageContent(event.message.id);
+    const chunks = [];
+    for await (const chunk of stream) chunks.push(chunk);
+    const imageBase64 = Buffer.concat(chunks).toString('base64');
+
+    // Ask Haiku to read the label and return structured JSON
+    const response = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 300,
+      messages: [{
+        role: 'user',
+        content: [
+          {
+            type: 'image',
+            source: { type: 'base64', media_type: 'image/jpeg', data: imageBase64 },
+          },
+          {
+            type: 'text',
+            text: 'นี่คือฉลากยา กรุณาอ่านชื่อยาและขนาดยา ตอบเป็น JSON เท่านั้น ห้ามมีข้อความอื่น: {"name":"ชื่อยา","dosage":"ขนาดยา"}',
+          },
+        ],
+      }],
+    });
+
+    const raw = response.content.find(b => b.type === 'text')?.text ?? '';
+    let name = null;
+    let dosage = null;
+
+    try {
+      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        const parsed = JSON.parse(jsonMatch[0]);
+        name = parsed.name;
+        dosage = parsed.dosage;
+      }
+    } catch (e) {
+      // JSON parse failed — try to use raw text as name
+      name = raw.trim().split('\n')[0].substring(0, 100);
+    }
+
+    if (!name || name.length < 2) {
+      await client.replyMessage({
+        replyToken: event.replyToken,
+        messages: [{ type: 'text',
+          text: 'ขอโทษครับ ลุงอ่านฉลากไม่ออก ช่วยถ่ายใหม่ให้ชัดขึ้น หรือพิมพ์ชื่อยามาแทนได้ไหมครับ?' }],
+      });
+      return;
+    }
+
+    // Save with default morning schedule — user can update later
+    const result = await pool.query(
+      `INSERT INTO medications (patient_id, name, dosage, schedule, active, source)
+       VALUES ($1, $2, $3, ARRAY['08:00'], TRUE, 'photo')
+       RETURNING id, name, dosage, schedule`,
+      [patient.id, name, dosage]
+    );
+    const med = result.rows[0];
+
+    await client.replyMessage({
+      replyToken: event.replyToken,
+      messages: [buildQuickReply(
+        `อ่านได้ครับ 💊\n✅ ${formatMedConfirmation(med)}\n(เวลากินตั้งเป็นเช้าไว้ก่อน แก้ไขได้ทีหลังนะครับ)\n\nมียาตัวอื่นอีกไหมครับ?`,
+        [
+          { label: '💊 มียาอีก', text: 'มียาอีก' },
+          { label: '✅ หมดแล้ว', text: 'หมดแล้ว' },
+        ]
+      )],
+    });
+
+  } catch (err) {
+    console.error('Image during onboarding error:', err.message);
+    await client.replyMessage({
+      replyToken: event.replyToken,
+      messages: [{ type: 'text',
+        text: 'ขอโทษครับ ลุงอ่านรูปไม่ออก ช่วยถ่ายใหม่หรือพิมพ์ชื่อยามาได้ไหมครับ?' }],
     });
   }
 }
@@ -732,9 +1022,16 @@ async function handleEvent(event) {
   const patientId = patient.id;
 
   // Route to onboarding if not complete
-  if (needsOnboarding(patient) && event.message.type === 'text') {
-    await handleOnboarding(event, patient);
-    return;
+  if (needsOnboarding(patient)) {
+    // Allow image during asking_more_meds state (photo of label)
+    if (event.message.type === 'image' && patient.onboarding_state === 'asking_more_meds') {
+      await handleImageDuringOnboarding(event, patient);
+      return;
+    }
+    if (event.message.type === 'text') {
+      await handleOnboarding(event, patient);
+      return;
+    }
   }
 
   if (event.message.type === 'text') {
