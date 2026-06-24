@@ -372,7 +372,20 @@ async function handleOnboarding(event, patient) {
     }
 
     // UNCLEAR — try to parse as med name directly
-    await handleMedEntry(replyToken, patientId, text, patient);
+    const { name: directName } = parseMedication(text);
+    if (directName && directName.length >= 2) {
+      await handleMedEntry(replyToken, patientId, text, patient);
+      return;
+    }
+    // Genuinely unclear — ask again with buttons
+    await client.replyMessage({ replyToken, messages: [buildQuickReply(
+      'ขอโทษครับ ลุงยังไม่เข้าใจ — ตอนนี้ทานยาประจำอยู่ไหมครับ?',
+      [
+        { label: '💊 มียา — พิมพ์บอกลุง', text: 'มียา' },
+        { label: '📷 ถ่ายรูปฉลากยา', text: 'ถ่ายรูปยา' },
+        { label: '🚫 ไม่มียา', text: 'ไม่มียา' },
+      ]
+    )]});
     return;
   }
 
@@ -398,6 +411,22 @@ async function handleOnboarding(event, patient) {
 
   // ── asking_more_meds: loop ─────────────────────────────────
   if (state === 'asking_more_meds') {
+    // Try to parse as a medication name FIRST before classifying intent.
+    // This handles Thai supplement/vitamin names like วิตามินซี, แคลเซียม,
+    // ยาความดัน etc. which the intent classifier wrongly marks as OTHER/DONE.
+    // Rule: if the text is short (< 30 chars) and doesn't start with a
+    // clear "done" or "more" signal word, try parsing it as a med name first.
+    const { name: parsedName } = parseMedication(text);
+    const doneWords = ['หมด','พอ','เท่านี้','เท่า','ถูก','โอเค','ok','ใช่','ครบ','เสร็จ'];
+    const moreWords = ['มียาอีก','มีอีก','เพิ่ม'];
+    const startsWithDoneOrMore = [...doneWords, ...moreWords].some(w => text.toLowerCase().startsWith(w) || text === w);
+
+    if (parsedName && parsedName.length >= 2 && !startsWithDoneOrMore && text.length < 60) {
+      await handleMedEntry(replyToken, patientId, text, patient);
+      return;
+    }
+
+    // Not obviously a med name — classify intent
     const intent = await classifyIntent(text, 'done_or_more');
 
     if (intent === 'DONE') {
