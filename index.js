@@ -309,10 +309,26 @@ async function handleOnboarding(event, patient) {
     }
 
     if (intent === 'FAMILY') {
-      await pool.query(`UPDATE households SET mode = 'guardian' WHERE id = (SELECT household_id FROM patients WHERE id = $1)`, [patientId]);
-      await pool.query(`UPDATE patients SET care_mode = 'family' WHERE id = $1`, [patientId]);
-      await setOnboardingState(patientId, 'complete');
-      await client.replyMessage({ replyToken, messages: [{ type: 'text', text: 'ดีมากเลยครับที่ดูแลคุณพ่อคุณแม่ 🙏\nระบบเชิญสมาชิกกำลังพัฒนาอยู่ครับ เร็ว ๆ นี้จะใช้ได้เลยครับ' }]});
+      // Update household mode
+      const hhResult = await pool.query(
+        `SELECT household_id FROM patients WHERE id=$1`, [patientId]
+      );
+      const householdId = hhResult.rows[0].household_id;
+      await pool.query(`UPDATE households SET mode='guardian' WHERE id=$1`, [householdId]);
+
+      // Create guardian record for this LINE user
+      await pool.query(
+        `INSERT INTO guardians (household_id, line_user_id, display_name, notification_level)
+         VALUES ($1, $2, $3, 'realtime')
+         ON CONFLICT (household_id) DO UPDATE SET line_user_id=$2`,
+        [householdId, lineUserId, patient.display_name]
+      );
+
+      // Keep the placeholder patient — we'll fill it with parent's info next
+      // Move to guardian patient setup flow
+      await setOnboardingState(patientId, 'guardian_asking_patient_name');
+      await client.replyMessage({ replyToken, messages: [{ type: 'text',
+        text: 'ดีมากเลยครับที่ดูแลคุณพ่อคุณแม่ 🙏\nลุงจะช่วยตั้งค่าให้ก่อนส่งลิงก์ให้ท่านนะครับ\n\nขอทราบชื่อคุณพ่อหรือคุณแม่ที่จะดูแลด้วยได้ไหมครับ?' }]});
       return;
     }
 
@@ -330,7 +346,185 @@ async function handleOnboarding(event, patient) {
     return;
   }
 
-  // ── asking_conditions: save + ask meds ────────────────────
+  // ── guardian_asking_patient_name ───────────────────────────
+  if (state === 'guardian_asking_patient_name') {
+    if (!text || text.length < 1) {
+      await client.replyMessage({ replyToken, messages: [{ type: 'text',
+        text: 'ขอโทษครับ ลุงยังไม่ได้ยินชื่อ ช่วยพิมพ์ชื่อมาอีกครั้งได้ไหมครับ?' }]});
+      return;
+    }
+    await pool.query(`UPDATE patients SET display_name=$1 WHERE id=$2`, [text, patientId]);
+    await setOnboardingState(patientId, 'guardian_asking_patient_conditions');
+    await client.replyMessage({ replyToken, messages: [buildQuickReply(
+      `คุณ${text}มีโรคประจำตัวไหมครับ?`,
+      [
+        { label: '❤️ ความดัน',        text: 'ความดัน' },
+        { label: '🩸 เบาหวาน',        text: 'เบาหวาน' },
+        { label: '❤️🩸 ทั้งสองอย่าง', text: 'ความดันและเบาหวาน' },
+        { label: '✨ ไม่มี',           text: 'ไม่มี' },
+      ]
+    )]});
+    return;
+  }
+
+  // ── guardian_asking_patient_conditions ─────────────────────
+  if (state === 'guardian_asking_patient_conditions') {
+    const condIntent = await classifyIntent(text, 'has_conditions');
+    const conditions = condIntent === 'NO_CONDITIONS' ? null : text;
+    await pool.query(`UPDATE patients SET conditions=$1 WHERE id=$2`, [conditions, patientId]);
+    await setOnboardingState(patientId, 'guardian_asking_patient_meds');
+    await client.replyMessage({ replyToken, messages: [buildQuickReply(
+      'รับทราบครับ 👍\nคุณพ่อ/คุณแม่ทานยาประจำอยู่ไหมครับ?',
+      [
+        { label: '💊 มียา — พิมพ์บอกลุง', text: 'มียา' },
+        { label: '📷 ถ่ายรูปฉลากยา',      text: 'ถ่ายรูปยา' },
+        { label: '🚫 ไม่มียา',             text: 'ไม่มียา' },
+      ]
+    )]});
+    return;
+  }
+
+  // ── guardian_asking_patient_meds ───────────────────────────
+  if (state === 'guardian_asking_patient_meds') {
+    const medIntent = await classifyIntent(text, 'has_meds');
+    if (medIntent === 'NO_MEDS') {
+      await setOnboardingState(patientId, 'guardian_confirming');
+      await guardianShowConfirmation(replyToken, patientId);
+      return;
+    }
+    if (medIntent === 'PHOTO') {
+      await setOnboardingState(patientId, 'guardian_asking_more_meds');
+      await client.replyMessage({ replyToken, messages: [{ type: 'text',
+        text: 'ถ่ายรูปฉลากยามาได้เลยครับ 📷' }]});
+      return;
+    }
+    if (medIntent === 'HAS_MEDS') {
+      await setOnboardingState(patientId, 'guardian_asking_more_meds');
+      await client.replyMessage({ replyToken, messages: [{ type: 'text',
+        text: 'พิมพ์ชื่อยามาได้เลยครับ เช่น "Amlodipine 5mg"\nลุงจะถามเวลากินให้ครับ 💊' }]});
+      return;
+    }
+    await handleGuardianMedEntry(replyToken, patientId, text, patient);
+    return;
+  }
+
+  // ── guardian_asking_med_time ───────────────────────────────
+  if (state === 'guardian_asking_med_time') {
+    const pendingResult = await pool.query(
+      `SELECT pending_med_name, pending_med_dosage FROM patients WHERE id=$1`, [patientId]
+    );
+    const { pending_med_name, pending_med_dosage } = pendingResult.rows[0];
+    const { schedule } = parseMedication(text);
+    const finalSchedule = schedule.length > 0 ? schedule : ['08:00'];
+    const med = await saveMedicationToDB(patientId, pending_med_name, pending_med_dosage, finalSchedule);
+    await pool.query(
+      `UPDATE patients SET pending_med_name=$1, pending_med_dosage=NULL,
+       onboarding_state='guardian_asking_pill_count' WHERE id=$2`,
+      [med.name, patientId]
+    );
+    await client.replyMessage({ replyToken, messages: [buildQuickReply(
+      `จดไว้แล้วครับ 💊\n✅ ${formatMed(med)}\n\nมียา${med.name}เหลืออยู่กี่เม็ดครับ?`,
+      [
+        { label: '30 เม็ด',      text: '30' },
+        { label: '60 เม็ด',      text: '60' },
+        { label: '90 เม็ด',      text: '90' },
+        { label: '⌨️ พิมพ์เอง', text: 'พิมพ์จำนวน' },
+        { label: '❌ ไม่ทราบ',   text: 'ไม่ทราบ' },
+      ]
+    )]});
+    return;
+  }
+
+  // ── guardian_asking_pill_count ─────────────────────────────
+  if (state === 'guardian_asking_pill_count') {
+    const pendingResult = await pool.query(
+      `SELECT pending_med_name FROM patients WHERE id=$1`, [patientId]
+    );
+    const medName = pendingResult.rows[0]?.pending_med_name;
+    const numMatch = text.match(/\d+/);
+    const pills = numMatch ? parseInt(numMatch[0]) : null;
+    const unknown = text.includes('ไม่ทราบ') || text.includes('ไม่รู้');
+
+    if (pills && !unknown) {
+      const doseResult = await pool.query(
+        `SELECT array_length(schedule,1) as doses_per_day FROM medications
+         WHERE patient_id=$1 AND name=$2 AND active=TRUE ORDER BY created_at DESC LIMIT 1`,
+        [patientId, medName]
+      );
+      const dosesPerDay = doseResult.rows[0]?.doses_per_day || 1;
+      await pool.query(
+        `UPDATE medications SET pills_remaining=$1, refill_alert_at=$2
+         WHERE patient_id=$3 AND name=$4 AND active=TRUE`,
+        [pills, Math.max(7, dosesPerDay * 7), patientId, medName]
+      );
+    }
+    await pool.query(
+      `UPDATE patients SET pending_med_name=NULL, onboarding_state='guardian_asking_more_meds' WHERE id=$1`,
+      [patientId]
+    );
+    await client.replyMessage({ replyToken, messages: [buildQuickReply(
+      pills && !unknown ? `รับทราบครับ จด ${pills} เม็ดไว้แล้ว 👍\nมียาตัวอื่นอีกไหมครับ?`
+                        : 'รับทราบครับ 👍\nมียาตัวอื่นอีกไหมครับ?',
+      [{ label: '💊 มียาอีก', text: 'มียาอีก' }, { label: '✅ หมดแล้ว', text: 'หมดแล้ว' }]
+    )]});
+    return;
+  }
+
+  // ── guardian_asking_more_meds ──────────────────────────────
+  if (state === 'guardian_asking_more_meds') {
+    const { name: parsedName } = parseMedication(text);
+    const doneWords = ['หมด','พอ','เท่านี้','ถูก','โอเค','ok','ใช่','ครบ','เสร็จ'];
+    const startsWithDone = doneWords.some(w => text.toLowerCase().startsWith(w) || text === w);
+
+    if (parsedName && parsedName.length >= 2 && !startsWithDone && text.length < 60) {
+      await handleGuardianMedEntry(replyToken, patientId, text, patient);
+      return;
+    }
+    const doneIntent = await classifyIntent(text, 'done_or_more');
+    if (doneIntent === 'DONE') {
+      await setOnboardingState(patientId, 'guardian_confirming');
+      await guardianShowConfirmation(replyToken, patientId);
+      return;
+    }
+    if (doneIntent === 'MORE') {
+      await client.replyMessage({ replyToken, messages: [{ type: 'text',
+        text: 'พิมพ์ชื่อยาตัวต่อไปได้เลยครับ 💊' }]});
+      return;
+    }
+    await handleGuardianMedEntry(replyToken, patientId, text, patient);
+    return;
+  }
+
+  // ── guardian_confirming ────────────────────────────────────
+  if (state === 'guardian_confirming') {
+    const confirmIntent = await classifyIntent(text, 'correct_or_edit');
+    if (confirmIntent === 'CORRECT') {
+      await setOnboardingState(patientId, 'complete');
+      const patientData = await pool.query(`SELECT display_name FROM patients WHERE id=$1`, [patientId]);
+      const patientName = patientData.rows[0]?.display_name;
+      try {
+        const { deepLink } = await createInviteLink(lineUserId, patientName);
+        const card = buildInviteCard(deepLink, patientName);
+        await client.replyMessage({ replyToken, messages: [
+          { type: 'text',
+            text: `เยี่ยมเลยครับ 🎉 ตั้งค่าเสร็จแล้ว!\nลุงสร้างลิงก์เชิญคุณ${patientName || 'ท่าน'}ให้แล้วครับ\nส่งลิงก์นี้ให้ท่านกดเพื่อเริ่มใช้งานได้เลยครับ:` },
+          card,
+        ]});
+      } catch (err) {
+        await client.replyMessage({ replyToken, messages: [{ type: 'text',
+          text: `เยี่ยมเลยครับ 🎉\nพิมพ์ "เชิญ" เพื่อสร้างลิงก์ให้คุณ${patientName || 'ท่าน'}ได้เลยครับ` }]});
+      }
+      return;
+    }
+    if (confirmIntent === 'EDIT') {
+      await setOnboardingState(patientId, 'guardian_asking_more_meds');
+      await client.replyMessage({ replyToken, messages: [{ type: 'text',
+        text: 'บอกลุงได้เลยครับ อยากแก้ไขยาตัวไหน หรือเพิ่ม/ลบอะไรครับ?' }]});
+      return;
+    }
+    await guardianShowConfirmation(replyToken, patientId);
+    return;
+  }
   if (state === 'asking_conditions') {
     const intent = await classifyIntent(text, 'has_conditions');
     const conditions = intent === 'NO_CONDITIONS' ? null : text;
@@ -534,6 +728,69 @@ async function handleOnboarding(event, patient) {
     )]});
     return;
   }
+}
+
+// Guardian confirmation card — shows patient info + med list for review
+async function guardianShowConfirmation(replyToken, patientId) {
+  const patientData = await pool.query(
+    `SELECT display_name, conditions FROM patients WHERE id=$1`, [patientId]
+  );
+  const p = patientData.rows[0];
+  const card = await buildMedCard(patientId, `💊 ยาของคุณ${p.display_name || 'ท่าน'}`);
+
+  await client.replyMessage({ replyToken, messages: [
+    { type: 'text',
+      text: `ข้อมูลคุณ${p.display_name || 'ท่าน'}:\n` +
+            `• โรคประจำตัว: ${p.conditions || 'ไม่มี'}` },
+    card,
+    buildQuickReply(
+      'ข้อมูลถูกต้องไหมครับ?',
+      [
+        { label: '✅ ถูกต้องแล้ว',   text: 'ถูกต้องแล้ว' },
+        { label: '✏️ แก้ไขบางอย่าง', text: 'อยากแก้ไข' },
+      ]
+    ),
+  ]});
+}
+
+// Guardian med entry — same as patient but stays in guardian states
+async function handleGuardianMedEntry(replyToken, patientId, text, patient) {
+  const { name, dosage, schedule } = parseMedication(text);
+
+  if (!name || name.length < 2) {
+    await client.replyMessage({ replyToken, messages: [{ type: 'text',
+      text: 'ขอโทษครับ ลุงอ่านชื่อยาไม่ออก ช่วยพิมพ์ชื่อยาอีกครั้งได้ไหมครับ?' }]});
+    return;
+  }
+
+  if (!hasTimeInfo(text)) {
+    await pool.query(
+      `UPDATE patients SET pending_med_name=$1, pending_med_dosage=$2,
+       onboarding_state='guardian_asking_med_time' WHERE id=$3`,
+      [name, dosage, patientId]
+    );
+    await client.replyMessage({ replyToken, messages: [buildQuickReply(
+      `${name}${dosage ? ` ${dosage}` : ''} — ทานตอนไหนครับ?`,
+      TIME_BUTTONS
+    )]});
+    return;
+  }
+
+  const med = await saveMedicationToDB(patientId, name, dosage, schedule);
+  await pool.query(
+    `UPDATE patients SET pending_med_name=$1, onboarding_state='guardian_asking_pill_count' WHERE id=$2`,
+    [med.name, patientId]
+  );
+  await client.replyMessage({ replyToken, messages: [buildQuickReply(
+    `จดไว้แล้วครับ 💊\n✅ ${formatMed(med)}\n\nมียา${med.name}เหลืออยู่กี่เม็ดครับ?`,
+    [
+      { label: '30 เม็ด',      text: '30' },
+      { label: '60 เม็ด',      text: '60' },
+      { label: '90 เม็ด',      text: '90' },
+      { label: '⌨️ พิมพ์เอง', text: 'พิมพ์จำนวน' },
+      { label: '❌ ไม่ทราบ',   text: 'ไม่ทราบ' },
+    ]
+  )]});
 }
 
 // Helper: handle med entry + ask for time if missing
@@ -1405,6 +1662,170 @@ async function isGuardian(lineUserId) {
   return result.rows.length > 0;
 }
 
+// ============================================================
+// GUARDIAN INVITE LINK SYSTEM
+// ============================================================
+
+const INVITE_TRIGGERS = [
+  'เชิญ', 'ส่งลิงก์', 'ลิงก์เชิญ', 'เพิ่มพ่อ', 'เพิ่มแม่',
+  'เพิ่มผู้ป่วย', 'เพิ่มสมาชิก', 'invite', 'link',
+];
+
+// Generate a cryptographically random token
+function generateToken() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
+  let token = '';
+  for (let i = 0; i < 24; i++) {
+    token += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return token;
+}
+
+// Create invite for a guardian — one token per patient slot
+async function createInviteLink(guardianLineUserId, patientName) {
+  // Ensure guardian record exists
+  const guardianResult = await pool.query(
+    `SELECT g.id, g.household_id FROM guardians g WHERE g.line_user_id=$1`,
+    [guardianLineUserId]
+  );
+  if (guardianResult.rows.length === 0) {
+    throw new Error('Guardian record not found');
+  }
+
+  const { id: guardianId, household_id: householdId } = guardianResult.rows[0];
+
+  // Create a new patient record (placeholder — filled when patient taps link)
+  const patientResult = await pool.query(
+    `INSERT INTO patients (household_id, display_name, care_mode, onboarding_state)
+     VALUES ($1, $2, 'family', 'pending_invite')
+     RETURNING id`,
+    [householdId, patientName || null]
+  );
+  const patientId = patientResult.rows[0].id;
+
+  // Generate one-time token valid for 24h
+  const token = generateToken();
+  await pool.query(
+    `INSERT INTO invite_tokens (patient_id, token, expires_at)
+     VALUES ($1, $2, NOW() + INTERVAL '24 hours')`,
+    [patientId, token]
+  );
+
+  // LINE deep link — when tapped, opens LINE chat with bot
+  // and auto-sends the token as a message
+  const botId = process.env.LINE_BOT_ID || '';
+  const deepLink = botId
+    ? `https://line.me/R/oaMessage/${botId}/?INVITE_${token}`
+    : `https://line.me/ti/p/@lungnote`; // fallback
+
+  return { token, deepLink, patientId, patientName };
+}
+
+// Handle invite token sent by patient clicking the link
+async function handleInviteToken(lineUserId, token) {
+  // Look up the token
+  const tokenResult = await pool.query(
+    `SELECT it.patient_id, it.used, it.expires_at, p.display_name, p.household_id
+     FROM invite_tokens it
+     JOIN patients p ON p.id = it.patient_id
+     WHERE it.token = $1`,
+    [token]
+  );
+
+  if (tokenResult.rows.length === 0) {
+    return { success: false, reason: 'not_found' };
+  }
+
+  const row = tokenResult.rows[0];
+
+  if (row.used) return { success: false, reason: 'used' };
+  if (new Date(row.expires_at) < new Date()) return { success: false, reason: 'expired' };
+
+  // Check if this LINE user already has a patient record
+  const existingPatient = await pool.query(
+    `SELECT id FROM patients WHERE line_user_id=$1`, [lineUserId]
+  );
+  if (existingPatient.rows.length > 0) {
+    return { success: false, reason: 'already_linked' };
+  }
+
+  // Link this LINE user to the placeholder patient record
+  await pool.query(
+    `UPDATE patients
+     SET line_user_id=$1, onboarding_state='complete', consented=TRUE, consent_at=NOW()
+     WHERE id=$2`,
+    [lineUserId, row.patient_id]
+  );
+
+  // Mark token as used
+  await pool.query(
+    `UPDATE invite_tokens SET used=TRUE WHERE token=$1`, [token]
+  );
+
+  // Create a trial subscription for this patient
+  await pool.query(
+    `INSERT INTO patient_trials (patient_id) VALUES ($1) ON CONFLICT DO NOTHING`,
+    [row.patient_id]
+  );
+
+  // Notify the guardian
+  const guardianResult = await pool.query(
+    `SELECT g.line_user_id, g.display_name FROM guardians g
+     WHERE g.household_id=$1`, [row.household_id]
+  );
+
+  if (guardianResult.rows.length > 0) {
+    const guardianName = guardianResult.rows[0].display_name || '';
+    const patientLabel = row.display_name || 'ท่าน';
+    await client.pushMessage({
+      to: guardianResult.rows[0].line_user_id,
+      messages: [{ type: 'text',
+        text: `✅ คุณ${patientLabel}เชื่อมต่อกับลุงโน้ตแล้วครับ!\nลุงพร้อมดูแลและส่งรายงานให้คุณ${guardianName}แล้วนะครับ 😊` }],
+    });
+  }
+
+  return {
+    success: true,
+    patientName: row.display_name,
+    householdId: row.household_id,
+  };
+}
+
+// Build invite Flex Message card for guardian
+function buildInviteCard(deepLink, patientName, expiresIn = '24 ชั่วโมง') {
+  return {
+    type: 'flex',
+    altText: `ลิงก์เชิญสำหรับ${patientName || 'ผู้ที่คุณดูแล'}`,
+    contents: {
+      type: 'bubble', size: 'kilo',
+      header: {
+        type: 'box', layout: 'vertical',
+        contents: [{ type: 'text', text: '🔗 ลิงก์เชิญลุงโน้ต', weight: 'bold', size: 'md', color: '#ffffff' }],
+        backgroundColor: '#06C755', paddingAll: '14px',
+      },
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'md',
+        contents: [
+          { type: 'text', text: `สำหรับ: ${patientName || 'ผู้ที่คุณดูแล'}`, size: 'sm', color: '#333333', weight: 'bold' },
+          { type: 'text', text: 'ส่งลิงก์นี้ให้ท่านกดเพื่อเชื่อมต่อกับลุงโน้ตครับ', size: 'sm', color: '#666666', wrap: true },
+          { type: 'text', text: `⏰ หมดอายุใน ${expiresIn}`, size: 'xs', color: '#ff6b35' },
+          { type: 'text', text: '🔒 ใช้ได้ครั้งเดียว — ปลอดภัยครับ', size: 'xs', color: '#999999' },
+        ],
+        paddingAll: '14px',
+      },
+      footer: {
+        type: 'box', layout: 'vertical',
+        contents: [{
+          type: 'button',
+          action: { type: 'uri', label: '📤 ส่งให้ท่านทาง LINE', uri: deepLink },
+          style: 'primary', color: '#06C755',
+        }],
+        paddingAll: '12px',
+      },
+    },
+  };
+}
+
 
 // ============================================================
 // WEBHOOK + EVENT ROUTING
@@ -1530,6 +1951,53 @@ async function parseAndSaveAppointment(patientId, text) {
 async function handleTextMessage(event, patientId) {
   const userMessage = event.message.text;
   const lineUserId = event.source.userId;
+
+  // ── Invite token from patient clicking guardian link ──────
+  // Token messages arrive as "INVITE_XXXXXXXX"
+  if (userMessage.startsWith('INVITE_')) {
+    const token = userMessage.replace('INVITE_', '').trim();
+    const result = await handleInviteToken(lineUserId, token);
+
+    if (result.success) {
+      await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text',
+        text: `ยินดีต้อนรับครับ คุณ${result.patientName || ''}! 🎉\nลุงโน้ตพร้อมดูแลคุณแล้วนะครับ\nลูกหลานของคุณจะได้รับรายงานสุขภาพจากลุงด้วยนะครับ 😊\n\nบอกค่าความดัน น้ำตาล หรืออาการมาได้เลยครับ` }]});
+    } else if (result.reason === 'used') {
+      await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text',
+        text: 'ขอโทษครับ ลิงก์นี้ถูกใช้ไปแล้ว ขอให้ลูกหลานสร้างลิงก์ใหม่ให้นะครับ' }]});
+    } else if (result.reason === 'expired') {
+      await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text',
+        text: 'ขอโทษครับ ลิงก์หมดอายุแล้ว (ใช้ได้แค่ 24 ชั่วโมง) ขอให้ลูกหลานสร้างลิงก์ใหม่ให้นะครับ' }]});
+    } else if (result.reason === 'already_linked') {
+      await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text',
+        text: 'คุณเชื่อมต่อกับลุงโน้ตอยู่แล้วนะครับ 😊 พิมพ์มาคุยกับลุงได้เลยครับ' }]});
+    } else {
+      await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text',
+        text: 'ขอโทษครับ ลิงก์ไม่ถูกต้อง ขอให้ลูกหลานส่งลิงก์ใหม่ให้นะครับ' }]});
+    }
+    return;
+  }
+
+  // ── Guardian invite link generation ───────────────────────
+  if (await isGuardian(lineUserId) && INVITE_TRIGGERS.some(t => userMessage.includes(t))) {
+    // Extract patient name from message if provided
+    // e.g. "เชิญคุณพ่อสมชาย" → "สมชาย"
+    const nameMatch = userMessage.match(/(?:เชิญ|เพิ่ม)(?:คุณพ่อ|คุณแม่|พ่อ|แม่|ผู้ป่วย|สมาชิก)?\s*(.{1,20})?/);
+    const patientName = nameMatch?.[1]?.trim() || null;
+
+    try {
+      const { deepLink, token } = await createInviteLink(lineUserId, patientName);
+      const card = buildInviteCard(deepLink, patientName);
+      await client.replyMessage({ replyToken: event.replyToken, messages: [
+        card,
+        { type: 'text', text: 'กดปุ่มด้านบนเพื่อส่งลิงก์ให้ท่านทาง LINE ได้เลยครับ\nเมื่อท่านกดลิงก์และเปิด LINE ลุงจะแจ้งให้คุณทราบทันทีครับ 😊' },
+      ]});
+    } catch (err) {
+      console.error('Invite creation failed:', err.message);
+      await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text',
+        text: 'ขอโทษครับ เกิดข้อผิดพลาด ลองใหม่อีกครั้งได้ไหมครับ?' }]});
+    }
+    return;
+  }
 
   // Guardian dashboard request → serve Flex card from DB (฿0 LLM cost)
   if (await isGuardian(lineUserId) && DASHBOARD_TRIGGERS.some(t => userMessage.includes(t))) {
