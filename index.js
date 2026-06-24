@@ -897,7 +897,99 @@ cron.schedule('0 13 * * *', async () => {
   } catch (err) { console.error('❌ Daily summary cron:', err.message); }
 });
 
-console.log('📋 Daily summary cron scheduled (20:00 Bangkok)');
+// ============================================================
+// MISSED DOSE FOLLOW-UP
+// Runs every 5 minutes. Checks for reminders that fired 30 min
+// ago with no response → sends one follow-up push.
+// At 60 min with no response → marks missed, notifies guardian.
+// ============================================================
+
+cron.schedule('*/5 * * * *', async () => {
+  try {
+    const now = new Date();
+
+    // --- 30 min follow-up: still 'missed', no follow-up sent yet ---
+    const needsFollowUp = await pool.query(
+      `SELECT ml.id, ml.medication_id, ml.patient_id, ml.scheduled_at,
+              m.name, m.dosage,
+              p.line_user_id, p.display_name
+       FROM medication_logs ml
+       JOIN medications m ON m.id = ml.medication_id
+       JOIN patients p ON p.id = ml.patient_id
+       WHERE ml.status = 'missed'
+       AND ml.followup_sent = FALSE
+       AND ml.scheduled_at <= NOW() - INTERVAL '30 minutes'
+       AND ml.scheduled_at >= NOW() - INTERVAL '55 minutes'
+       AND p.line_user_id IS NOT NULL`,
+      []
+    );
+
+    for (const row of needsFollowUp.rows) {
+      try {
+        const name = row.display_name ? ` คุณ${row.display_name}` : '';
+        await client.pushMessage({
+          to: row.line_user_id,
+          messages: [{ type: 'text',
+            text: `🔔 ลุงโน้ตเป็นห่วงนะครับ${name}\nยัง${row.name}${row.dosage ? ` ${row.dosage}` : ''} ยังไม่ได้กินใช่ไหมครับ?\nถ้ากินแล้วตอบ "กินแล้ว" ได้เลยครับ 💊` }],
+        });
+        await pool.query(
+          `UPDATE medication_logs SET followup_sent=TRUE WHERE id=$1`,
+          [row.id]
+        );
+        console.log(`🔔 Follow-up sent: ${row.name} → ${row.line_user_id}`);
+      } catch (err) { console.error(`❌ Follow-up failed:`, err.message); }
+    }
+
+    // --- 60 min: still missed → notify guardian ---
+    const confirmedMissed = await pool.query(
+      `SELECT ml.id, ml.medication_id, ml.patient_id, ml.scheduled_at,
+              m.name, m.dosage,
+              p.line_user_id, p.display_name
+       FROM medication_logs ml
+       JOIN medications m ON m.id = ml.medication_id
+       JOIN patients p ON p.id = ml.patient_id
+       WHERE ml.status = 'missed'
+       AND ml.followup_sent = TRUE
+       AND ml.guardian_notified = FALSE
+       AND ml.scheduled_at <= NOW() - INTERVAL '60 minutes'
+       AND ml.scheduled_at >= NOW() - INTERVAL '23 hours'
+       AND p.line_user_id IS NOT NULL`,
+      []
+    );
+
+    for (const row of confirmedMissed.rows) {
+      try {
+        // Notify guardian if one exists
+        const guardian = await pool.query(
+          `SELECT g.line_user_id, g.notification_level
+           FROM guardians g
+           JOIN households h ON h.id = g.household_id
+           JOIN patients p ON p.household_id = h.id
+           WHERE p.id = $1 AND g.line_user_id IS NOT NULL`,
+          [row.patient_id]
+        );
+
+        if (guardian.rows.length > 0 && guardian.rows[0].notification_level !== 'summary_only') {
+          const patientLabel = row.display_name ? `คุณ${row.display_name}` : `ผู้ใช้ ...${row.patient_id.slice(-6)}`;
+          await client.pushMessage({
+            to: guardian.rows[0].line_user_id,
+            messages: [{ type: 'text',
+              text: `⚠️ แจ้งเตือนจากลุงโน้ต\n${patientLabel} ยังไม่ได้กิน${row.name}${row.dosage ? ` ${row.dosage}` : ''} ครับ\n(กำหนดเวลา ${new Date(new Date(row.scheduled_at).getTime() + 7*3600000).toLocaleTimeString('th-TH', {hour:'2-digit',minute:'2-digit'})} น.)` }],
+          });
+          console.log(`📲 Missed dose guardian notified: ${row.name}`);
+        }
+
+        await pool.query(
+          `UPDATE medication_logs SET guardian_notified=TRUE WHERE id=$1`,
+          [row.id]
+        );
+      } catch (err) { console.error(`❌ Missed dose notify failed:`, err.message); }
+    }
+
+  } catch (err) { console.error('❌ Follow-up cron:', err.message); }
+});
+
+console.log('🔔 Missed dose follow-up cron started (every 5 min)');
 
 // ============================================================
 // CAREGIVER DASHBOARD — Flex Message card
