@@ -399,17 +399,70 @@ async function handleOnboarding(event, patient) {
     const finalSchedule = schedule.length > 0 ? schedule : ['08:00'];
 
     const med = await saveMedicationToDB(patientId, pending_med_name, pending_med_dosage, finalSchedule);
-    await pool.query(`UPDATE patients SET pending_med_name = NULL, pending_med_dosage = NULL WHERE id = $1`, [patientId]);
-    await setOnboardingState(patientId, 'asking_more_meds');
+    await pool.query(
+      `UPDATE patients SET pending_med_name=$1, pending_med_dosage=NULL, onboarding_state='asking_pill_count' WHERE id=$2`,
+      [med.name, patientId]
+    );
 
     await client.replyMessage({ replyToken, messages: [buildQuickReply(
-      `จดไว้แล้วครับ 💊\n✅ ${formatMed(med)}\n\nมียาตัวอื่นอีกไหมครับ?`,
-      [{ label: '💊 มียาอีก', text: 'มียาอีก' }, { label: '✅ หมดแล้ว', text: 'หมดแล้ว' }]
+      `จดไว้แล้วครับ 💊\n✅ ${formatMed(med)}\n\nตอนนี้มียา${med.name}เหลืออยู่กี่เม็ดครับ? ลุงจะเตือนตอนใกล้หมดครับ`,
+      [
+        { label: '30 เม็ด',       text: '30' },
+        { label: '60 เม็ด',       text: '60' },
+        { label: '90 เม็ด',       text: '90' },
+        { label: '⌨️ พิมพ์เอง',  text: 'พิมพ์จำนวน' },
+        { label: '❌ ไม่ทราบ',    text: 'ไม่ทราบ' },
+      ]
     )]});
     return;
   }
 
-  // ── asking_more_meds: loop ─────────────────────────────────
+  // ── asking_pill_count: save pill count, continue to more meds ─
+  if (state === 'asking_pill_count') {
+    const pendingResult = await pool.query(
+      `SELECT pending_med_name FROM patients WHERE id=$1`, [patientId]
+    );
+    const medName = pendingResult.rows[0]?.pending_med_name;
+
+    // Parse a number from the reply
+    const numMatch = text.match(/\d+/);
+    const pills = numMatch ? parseInt(numMatch[0]) : null;
+    const unknown = text.includes('ไม่ทราบ') || text.includes('ไม่รู้') || text.includes('พิมพ์จำนวน');
+
+    if (pills && !unknown) {
+      // Save pill count + set refill alert at 7 days of supply
+      // (pills ÷ doses_per_day, min 7)
+      const doseResult = await pool.query(
+        `SELECT array_length(schedule,1) as doses_per_day FROM medications
+         WHERE patient_id=$1 AND name=$2 AND active=TRUE
+         ORDER BY created_at DESC LIMIT 1`,
+        [patientId, medName]
+      );
+      const dosesPerDay = doseResult.rows[0]?.doses_per_day || 1;
+      const refillAt = Math.max(7, dosesPerDay * 7); // 7 days supply
+
+      await pool.query(
+        `UPDATE medications SET pills_remaining=$1, refill_alert_at=$2
+         WHERE patient_id=$3 AND name=$4 AND active=TRUE`,
+        [pills, refillAt, patientId, medName]
+      );
+      console.log(`💊 Pill count saved: ${medName} = ${pills} เม็ด`);
+    }
+
+    // Clear pending and move to asking_more_meds
+    await pool.query(
+      `UPDATE patients SET pending_med_name=NULL, onboarding_state='asking_more_meds' WHERE id=$1`,
+      [patientId]
+    );
+
+    await client.replyMessage({ replyToken, messages: [buildQuickReply(
+      pills && !unknown
+        ? `รับทราบครับ จด ${pills} เม็ดไว้แล้ว ลุงจะเตือนตอนใกล้หมดนะครับ 👍\n\nมียาตัวอื่นอีกไหมครับ?`
+        : `รับทราบครับ 👍\n\nมียาตัวอื่นอีกไหมครับ?`,
+      [{ label: '💊 มียาอีก', text: 'มียาอีก' }, { label: '✅ หมดแล้ว', text: 'หมดแล้ว' }]
+    )]});
+    return;
+  }
   if (state === 'asking_more_meds') {
     // Try to parse as a medication name FIRST before classifying intent.
     // This handles Thai supplement/vitamin names like วิตามินซี, แคลเซียม,
@@ -504,11 +557,21 @@ async function handleMedEntry(replyToken, patientId, text, patient) {
     return;
   }
 
+  // Has time info — save med, then ask pill count
   const med = await saveMedicationToDB(patientId, name, dosage, schedule);
-  await pool.query(`UPDATE patients SET onboarding_state = 'asking_more_meds' WHERE id = $1`, [patientId]);
+  await pool.query(
+    `UPDATE patients SET pending_med_name=$1, onboarding_state='asking_pill_count' WHERE id=$2`,
+    [med.name, patientId]
+  );
   await client.replyMessage({ replyToken, messages: [buildQuickReply(
-    `จดไว้แล้วครับ 💊\n✅ ${formatMed(med)}\n\nมียาตัวอื่นอีกไหมครับ?`,
-    [{ label: '💊 มียาอีก', text: 'มียาอีก' }, { label: '✅ หมดแล้ว', text: 'หมดแล้ว' }]
+    `จดไว้แล้วครับ 💊\n✅ ${formatMed(med)}\n\nตอนนี้มียา${med.name}เหลืออยู่กี่เม็ดครับ? ลุงจะเตือนตอนใกล้หมดครับ`,
+    [
+      { label: '30 เม็ด',       text: '30' },
+      { label: '60 เม็ด',       text: '60' },
+      { label: '90 เม็ด',       text: '90' },
+      { label: '⌨️ พิมพ์เอง',  text: 'พิมพ์จำนวน' },
+      { label: '❌ ไม่ทราบ',    text: 'ไม่ทราบ' },
+    ]
   )]});
 }
 
@@ -990,6 +1053,80 @@ cron.schedule('*/5 * * * *', async () => {
 });
 
 console.log('🔔 Missed dose follow-up cron started (every 5 min)');
+
+// ============================================================
+// REFILL REMINDER CRON — runs daily at 09:00 Bangkok (02:00 UTC)
+// Fires when pills_remaining <= refill_alert_at
+// ============================================================
+
+cron.schedule('0 2 * * *', async () => {
+  // 02:00 UTC = 09:00 Bangkok
+  console.log('💊 Checking refill reminders...');
+  try {
+    const lowMeds = await pool.query(
+      `SELECT m.id, m.name, m.dosage, m.pills_remaining, m.refill_alert_at,
+              p.id as patient_id, p.line_user_id, p.display_name,
+              r.id as reminder_id
+       FROM medications m
+       JOIN patients p ON p.id = m.patient_id
+       LEFT JOIN refill_reminders r
+         ON r.medication_id = m.id AND r.sent = TRUE
+         AND r.sent_at > NOW() - INTERVAL '7 days'
+       WHERE m.active = TRUE
+       AND m.pills_remaining IS NOT NULL
+       AND m.pills_remaining <= m.refill_alert_at
+       AND p.line_user_id IS NOT NULL
+       AND r.id IS NULL`,  -- not already notified in last 7 days
+      []
+    );
+
+    console.log(`💊 ${lowMeds.rows.length} refill(s) needed`);
+
+    for (const med of lowMeds.rows) {
+      try {
+        const name = med.display_name ? ` คุณ${med.display_name}` : '';
+        const doseResult = await pool.query(
+          `SELECT array_length(schedule,1) as doses FROM medications WHERE id=$1`, [med.id]
+        );
+        const dosesPerDay = doseResult.rows[0]?.doses || 1;
+        const daysLeft = Math.floor(med.pills_remaining / dosesPerDay);
+
+        await client.pushMessage({
+          to: med.line_user_id,
+          messages: [{ type: 'text',
+            text: `⚠️ ยา${med.name}${med.dosage ? ` ${med.dosage}` : ''} ใกล้หมดแล้วครับ${name}\nเหลืออยู่ประมาณ ${daysLeft} วันครับ\nอย่าลืมขอยาเพิ่มจากแพทย์ด้วยนะครับ 🏥` }],
+        });
+
+        // Log reminder sent
+        await pool.query(
+          `INSERT INTO refill_reminders (medication_id, sent, sent_at) VALUES ($1, TRUE, NOW())`,
+          [med.id]
+        );
+
+        // Also notify guardian
+        const guardian = await pool.query(
+          `SELECT g.line_user_id FROM guardians g
+           JOIN households h ON h.id=g.household_id
+           JOIN patients p ON p.household_id=h.id
+           WHERE p.id=$1 AND g.line_user_id IS NOT NULL`,
+          [med.patient_id]
+        );
+        if (guardian.rows.length > 0) {
+          const patientLabel = med.display_name ? `คุณ${med.display_name}` : `ผู้ใช้ ...${med.patient_id.slice(-6)}`;
+          await client.pushMessage({
+            to: guardian.rows[0].line_user_id,
+            messages: [{ type: 'text',
+              text: `⚠️ แจ้งเตือนจากลุงโน้ต\nยา${med.name} ของ${patientLabel}ใกล้หมดแล้วครับ (เหลือ ~${daysLeft} วัน)\nช่วยพา${patientLabel}ไปขอยาเพิ่มด้วยนะครับ 🏥` }],
+          });
+        }
+
+        console.log(`✅ Refill reminder sent: ${med.name} → ${med.line_user_id}`);
+      } catch (err) { console.error(`❌ Refill reminder failed:`, err.message); }
+    }
+  } catch (err) { console.error('❌ Refill cron:', err.message); }
+});
+
+console.log('💊 Refill reminder cron scheduled (09:00 Bangkok)');
 
 // ============================================================
 // CAREGIVER DASHBOARD — Flex Message card
