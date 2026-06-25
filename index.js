@@ -269,7 +269,7 @@ async function handleOnboarding(event, patient) {
   const { replyToken } = event;
   const text = event.message?.text?.trim() || '';
   const { id: patientId } = patient;
-  const lineUserId = event.source.userId; // needed for guardian record creation
+  const lineUserId = event.source.userId;
   const state = patient.onboarding_state || 'new';
 
   // ── new: greet + ask name ──────────────────────────────────
@@ -1846,9 +1846,15 @@ async function handleEvent(event) {
   const patient = await getOrCreatePatient(lineUserId);
   const patientId = patient.id;
 
+  // Reset command works at any point — check before onboarding routing
+  if (event.message.type === 'text' && event.message.text?.trim() === 'RESET_LUNGNOTE_DEV') {
+    await handleTextMessage(event, patientId);
+    return;
+  }
+
   // Onboarding routing
   if (needsOnboarding(patient)) {
-    if (event.message.type === 'image' && patient.onboarding_state === 'asking_more_meds') {
+    if (event.message.type === 'image' && (patient.onboarding_state === 'asking_more_meds' || patient.onboarding_state === 'guardian_asking_more_meds')) {
       await handleImageDuringOnboarding(event, patient);
     } else if (event.message.type === 'text') {
       await handleOnboarding(event, patient);
