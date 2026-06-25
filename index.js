@@ -388,11 +388,11 @@ async function handleOnboarding(event, patient) {
   // ── guardian_asking_patient_meds ───────────────────────────
   if (state === 'guardian_asking_patient_meds') {
     // Try to parse as med name first — same fix as asking_more_meds
-    const { name: directName } = parseMedication(text);
-    const doneWords = ['หมด','พอ','เท่านี้','ถูก','โอเค','ok','ใช่','ครบ','เสร็จ','ไม่มี'];
-    const startsWithDone = doneWords.some(w => text.toLowerCase().startsWith(w) || text === w);
+    const { name: gDirectName } = parseMedication(text);
+    const gDoneWords = ['หมด','พอ','เท่านี้','ถูก','โอเค','ok','ใช่','ครบ','เสร็จ','ไม่มี'];
+    const gStartsWithDone = gDoneWords.some(w => text.toLowerCase().startsWith(w) || text === w);
 
-    if (directName && directName.length >= 2 && !startsWithDone && text.length < 60) {
+    if (gDirectName && gDirectName.length >= 2 && !gStartsWithDone && text.length < 60) {
       await handleGuardianMedEntry(replyToken, patientId, text, patient);
       return;
     }
@@ -555,11 +555,11 @@ async function handleOnboarding(event, patient) {
   // ── asking_meds: classify intent ──────────────────────────
   if (state === 'asking_meds') {
     // Try to parse as med name first before classifying intent
-    const { name: directName } = parseMedication(text);
-    const doneWords = ['หมด','พอ','เท่านี้','ถูก','โอเค','ok','ใช่','ครบ','เสร็จ','ไม่มี'];
-    const startsWithDone = doneWords.some(w => text.toLowerCase().startsWith(w) || text === w);
+    const { name: soloDirectName } = parseMedication(text);
+    const soloDoneWords = ['หมด','พอ','เท่านี้','ถูก','โอเค','ok','ใช่','ครบ','เสร็จ','ไม่มี'];
+    const soloStartsWithDone = soloDoneWords.some(w => text.toLowerCase().startsWith(w) || text === w);
 
-    if (directName && directName.length >= 2 && !startsWithDone && text.length < 60) {
+    if (soloDirectName && soloDirectName.length >= 2 && !soloStartsWithDone && text.length < 60) {
       await handleMedEntry(replyToken, patientId, text, patient);
       return;
     }
