@@ -269,6 +269,7 @@ async function handleOnboarding(event, patient) {
   const { replyToken } = event;
   const text = event.message?.text?.trim() || '';
   const { id: patientId } = patient;
+  const lineUserId = event.source.userId; // needed for guardian record creation
   const state = patient.onboarding_state || 'new';
 
   // ── new: greet + ask name ──────────────────────────────────
