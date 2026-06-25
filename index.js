@@ -1953,6 +1953,39 @@ async function handleTextMessage(event, patientId) {
   const userMessage = event.message.text;
   const lineUserId = event.source.userId;
 
+  // ── Admin reset command (dev only — protected by secret) ──
+  // Type: RESET_LUNGNOTE_DEV to wipe your own account
+  if (userMessage === 'RESET_LUNGNOTE_DEV') {
+    try {
+      const hResult = await pool.query(
+        `SELECT household_id FROM patients WHERE id=$1`, [patientId]
+      );
+      const hid = hResult.rows[0]?.household_id;
+
+      await pool.query(`DELETE FROM medications WHERE patient_id=$1`, [patientId]);
+      await pool.query(`DELETE FROM conversation_history WHERE patient_id=$1`, [patientId]);
+      await pool.query(`DELETE FROM medication_logs WHERE patient_id=$1`, [patientId]);
+      await pool.query(`DELETE FROM health_logs WHERE patient_id=$1`, [patientId]);
+      await pool.query(`DELETE FROM alerts WHERE patient_id=$1`, [patientId]);
+      await pool.query(`DELETE FROM appointment_reminders WHERE patient_id=$1`, [patientId]);
+      await pool.query(`DELETE FROM invite_tokens WHERE patient_id=$1`, [patientId]);
+      if (hid) await pool.query(`DELETE FROM guardians WHERE household_id=$1`, [hid]);
+      await pool.query(
+        `UPDATE patients SET onboarding_state='new', display_name=NULL, conditions=NULL,
+         pending_med_name=NULL, pending_med_dosage=NULL WHERE id=$1`,
+        [patientId]
+      );
+      medCache.delete(patientId);
+
+      await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text',
+        text: '🔄 รีเซ็ตบัญชีเรียบร้อยแล้วครับ ส่งข้อความใดก็ได้เพื่อเริ่ม onboarding ใหม่ครับ' }]});
+    } catch (err) {
+      await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text',
+        text: `❌ Reset failed: ${err.message}` }]});
+    }
+    return;
+  }
+
   // ── Invite token from patient clicking guardian link ──────
   // Token messages arrive as "INVITE_XXXXXXXX"
   if (userMessage.startsWith('INVITE_')) {
