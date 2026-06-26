@@ -151,8 +151,46 @@ For other intents, entities can be {} or relevant extracted info.`;
 }
 
 // ============================================================
-// MEDICATION PARSER
+// MEAL TIME PARSER — Haiku extracts 4 meal times from free text
+// Returns { morning, midday, evening, bedtime } as 'HH:MM' strings
+// Falls back to defaults for any time it can't extract
 // ============================================================
+
+const MEAL_DEFAULTS = { morning: '08:00', midday: '12:00', evening: '18:00', bedtime: '21:00' };
+
+function formatTime(hhmm) {
+  if (!hhmm) return null;
+  const [h, m] = hhmm.split(':').map(Number);
+  return `${String(h).padStart(2,'0')}:${String(m || 0).padStart(2,'0')}`;
+}
+
+async function parseMealTimes(text) {
+  try {
+    const response = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 80,
+      messages: [{ role: 'user', content:
+        `Extract meal/medication times from this message. Reply ONLY valid JSON, no other text:
+{"morning":"HH:MM","midday":"HH:MM","evening":"HH:MM","bedtime":"HH:MM"}
+Use null for any time not mentioned. 24-hour format only.
+Thai time words: โมงเช้า=morning, เที่ยง=12:00, โมงเย็น/บ่าย=evening, ทุ่ม=evening/bedtime (1ทุ่ม=19:00, 2ทุ่ม=20:00, 3ทุ่ม=21:00, 4ทุ่ม=22:00)
+Message: "${text}"` }],
+    });
+    const raw = response.content.find(b => b.type === 'text')?.text?.trim() || '{}';
+    const json = raw.match(/\{[\s\S]*\}/);
+    if (!json) return MEAL_DEFAULTS;
+    const parsed = JSON.parse(json[0]);
+    return {
+      morning: formatTime(parsed.morning) || MEAL_DEFAULTS.morning,
+      midday:  formatTime(parsed.midday)  || MEAL_DEFAULTS.midday,
+      evening: formatTime(parsed.evening) || MEAL_DEFAULTS.evening,
+      bedtime: formatTime(parsed.bedtime) || MEAL_DEFAULTS.bedtime,
+    };
+  } catch (err) {
+    console.error('parseMealTimes failed:', err.message);
+    return MEAL_DEFAULTS;
+  }
+}
 
 const SHORTHAND_TIMES = {
   'วันละครั้ง':        ['08:00'],
@@ -350,6 +388,22 @@ const S = (lang, key, ...args) => {
     ask_conditions_for: {
       th: (name) => `คุณ${name}มีโรคประจำตัวไหมครับ?`,
       en: (name) => `Does ${name} have any underlying conditions?`,
+    },
+    ask_meal_times: {
+      th: (name) => `ขอถามเรื่องเวลาทานยาด้วยนะครับ${name ? ` คุณ${name}` : ''} 💊\nปกติทานยาและอาหารตอนไหนครับ? พิมพ์บอกลุงได้เลยครับ\nเช่น "เช้า 7 โมงครึ่ง กลางวันเที่ยง เย็น 6 โมง ก่อนนอน 4 ทุ่ม"`,
+      en: (name) => `Quick question about your medication schedule${name ? `, ${name}` : ''} 💊\nWhat times do you usually take your meals and medication? Just type naturally, e.g.\n"breakfast 7:30am, lunch 12pm, dinner 6pm, bedtime 9pm"`,
+    },
+    ask_meal_times_for: {
+      th: (name) => `ขอถามเรื่องเวลาทานยาของคุณ${name || 'ท่าน'}ด้วยนะครับ 💊\nปกติท่านทานยาและอาหารตอนไหนครับ? พิมพ์บอกลุงได้เลยครับ\nเช่น "เช้า 7 โมงครึ่ง กลางวันเที่ยง เย็น 6 โมง ก่อนนอน 4 ทุ่ม"`,
+      en: (name) => `What times does ${name || 'your parent'} usually take their meals and medication? 💊\nJust type naturally, e.g.\n"breakfast 7:30am, lunch 12pm, dinner 6pm, bedtime 9pm"`,
+    },
+    meal_times_saved: {
+      th: (m, d, e, b) => `รับทราบครับ 😊\n🌅 เช้า — ${m}\n☀️ กลางวัน — ${d}\n🌆 เย็น — ${e}\n🌙 ก่อนนอน — ${b}\nลุงจะเตือนยาตามเวลานี้นะครับ`,
+      en: (m, d, e, b) => `Got it! 😊\n🌅 Morning — ${m}\n☀️ Midday — ${d}\n🌆 Evening — ${e}\n🌙 Bedtime — ${b}\nI'll send reminders at these times.`,
+    },
+    meal_times_retry: {
+      th: 'ขอโทษครับ ลุงยังไม่เข้าใจ ช่วยพิมพ์เวลาอีกครั้งได้ไหมครับ\nเช่น "เช้า 7 โมงครึ่ง กลางวันเที่ยง เย็น 6 โมง ก่อนนอน 4 ทุ่ม"',
+      en: 'Sorry, I didn\'t quite catch that. Could you type the times again? e.g.\n"breakfast 7:30am, lunch 12pm, dinner 6pm, bedtime 9pm"',
     },
     condition_buttons: {
       th: [
@@ -671,8 +725,31 @@ async function handleOnboarding(event, patient) {
     const condIntent = await classifyIntent(text, 'has_conditions');
     const conditions = condIntent === 'NO_CONDITIONS' ? null : text;
     await pool.query(`UPDATE patients SET conditions=$1 WHERE id=$2`, [conditions, patientId]);
+    await setOnboardingState(patientId, 'guardian_asking_meal_times');
+    const patientNameResult = await pool.query(`SELECT display_name FROM patients WHERE id=$1`, [patientId]);
+    const patientName = patientNameResult.rows[0]?.display_name;
+    await client.replyMessage({ replyToken, messages: [{ type: 'text',
+      text: S(l, 'ask_meal_times_for', patientName) }]});
+    return;
+  }
+
+  // ── guardian_asking_meal_times ─────────────────────────────
+  if (state === 'guardian_asking_meal_times') {
+    const looksEmpty = text.trim().length < 3;
+    if (looksEmpty) {
+      await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'meal_times_retry') }]});
+      return;
+    }
+    const times = await parseMealTimes(text);
+    await pool.query(
+      `UPDATE patients SET meal_morning=$1, meal_midday=$2, meal_evening=$3, meal_bedtime=$4 WHERE id=$5`,
+      [times.morning, times.midday, times.evening, times.bedtime, patientId]
+    );
     await setOnboardingState(patientId, 'guardian_asking_patient_meds');
-    await client.replyMessage({ replyToken, messages: [buildQuickReply(S(l, 'ask_meds_for'), S(l, 'med_buttons'))]});
+    await client.replyMessage({ replyToken, messages: [
+      { type: 'text', text: S(l, 'meal_times_saved', times.morning, times.midday, times.evening, times.bedtime) },
+      buildQuickReply(S(l, 'ask_meds_for'), S(l, 'med_buttons')),
+    ]});
     return;
   }
 
@@ -795,8 +872,30 @@ async function handleOnboarding(event, patient) {
     const intent = await classifyIntent(text, 'has_conditions');
     const conditions = intent === 'NO_CONDITIONS' ? null : text;
     await pool.query(`UPDATE patients SET conditions = $1 WHERE id = $2`, [conditions, patientId]);
+    await setOnboardingState(patientId, 'asking_meal_times');
+    await client.replyMessage({ replyToken, messages: [{ type: 'text',
+      text: S(l, 'ask_meal_times', patient.display_name) }]});
+    return;
+  }
+
+  // ── asking_meal_times: parse personal schedule, then ask meds ─
+  if (state === 'asking_meal_times') {
+    const times = await parseMealTimes(text);
+    // Need at least one recognisable time — if all are defaults and text looks like gibberish, retry
+    const looksEmpty = text.trim().length < 3;
+    if (looksEmpty) {
+      await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'meal_times_retry') }]});
+      return;
+    }
+    await pool.query(
+      `UPDATE patients SET meal_morning=$1, meal_midday=$2, meal_evening=$3, meal_bedtime=$4 WHERE id=$5`,
+      [times.morning, times.midday, times.evening, times.bedtime, patientId]
+    );
     await setOnboardingState(patientId, 'asking_meds');
-    await client.replyMessage({ replyToken, messages: [buildQuickReply(S(l, 'ask_meds'), S(l, 'med_buttons'))]});
+    await client.replyMessage({ replyToken, messages: [
+      { type: 'text', text: S(l, 'meal_times_saved', times.morning, times.midday, times.evening, times.bedtime) },
+      buildQuickReply(S(l, 'ask_meds'), S(l, 'med_buttons')),
+    ]});
     return;
   }
 
@@ -1320,11 +1419,25 @@ async function getMedicationsDue() {
   const bkk = new Date(now.getTime() + 7 * 3600000);
   const hh = String(bkk.getUTCHours()).padStart(2, '0');
   const mm = String(bkk.getUTCMinutes()).padStart(2, '0');
+  const currentTime = `${hh}:${mm}`;
+
+  // Match current Bangkok time against each patient's personal meal times.
+  // medications.schedule stores slot names ('08:00','12:00','18:00','21:00') as anchors.
+  // We compare the patient's personal times to the current clock time,
+  // then check if the corresponding anchor slot is in the medication's schedule.
   const result = await pool.query(
-    `SELECT m.id as medication_id, m.name, m.dosage, p.id as patient_id, p.line_user_id, p.display_name, p.language
+    `SELECT m.id as medication_id, m.name, m.dosage, m.schedule,
+            p.id as patient_id, p.line_user_id, p.display_name, p.language,
+            p.meal_morning, p.meal_midday, p.meal_evening, p.meal_bedtime
      FROM medications m JOIN patients p ON p.id=m.patient_id
-     WHERE m.active=TRUE AND p.line_user_id IS NOT NULL AND $1=ANY(m.schedule)`,
-    [`${hh}:${mm}`]
+     WHERE m.active=TRUE AND p.line_user_id IS NOT NULL
+     AND (
+       ($1 = to_char(p.meal_morning, 'HH24:MI') AND '08:00' = ANY(m.schedule)) OR
+       ($1 = to_char(p.meal_midday,  'HH24:MI') AND '12:00' = ANY(m.schedule)) OR
+       ($1 = to_char(p.meal_evening, 'HH24:MI') AND '18:00' = ANY(m.schedule)) OR
+       ($1 = to_char(p.meal_bedtime, 'HH24:MI') AND '21:00' = ANY(m.schedule))
+     )`,
+    [currentTime]
   );
   return result.rows;
 }
