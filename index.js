@@ -1083,6 +1083,9 @@ async function saveHealthLog(patientId, reading, source = 'chat') {
   const logId = logResult.rows[0].id;
   console.log(`✅ Health log: ${reading.type} ${reading.value_1} [${reading.alert_level}]`);
 
+  // Update real-time snapshot (non-blocking)
+  updateSnapshot(patientId);
+
   if (reading.alert_level !== 'normal' && reading.alert_level !== 'pending') {
     const alertResult = await pool.query(
       `INSERT INTO alerts (health_log_id, patient_id, type, severity, guardian_notified) VALUES ($1,$2,$3,$4,FALSE) RETURNING id`,
@@ -1126,6 +1129,86 @@ async function notifyGuardian(patientId, reading, alertId) {
     await pool.query(`UPDATE alerts SET guardian_notified=TRUE WHERE id=$1`, [alertId]);
     console.log(`📲 Guardian notified: ${reading.type} ${reading.alert_level}`);
   } catch (err) { console.error('Guardian notify failed:', err.message); }
+}
+
+// ============================================================
+// PATIENT SNAPSHOT — real-time materialized view
+// Called after every health log save and med log update.
+// Dashboard reads this → always current, zero LLM cost, 1 DB query.
+// ============================================================
+
+async function updateSnapshot(patientId) {
+  try {
+    const bangkokDate = `(NOW() AT TIME ZONE 'Asia/Bangkok')::date`;
+
+    // Run all 3 queries in parallel
+    const [vitalsResult, medResult, alertResult] = await Promise.all([
+      // Latest reading of each vital type today
+      pool.query(
+        `SELECT DISTINCT ON (type) type, value_1, value_2, unit, alert_level, recorded_at
+         FROM health_logs
+         WHERE patient_id=$1 AND confirmed=TRUE
+         AND recorded_at::date = ${bangkokDate}
+         ORDER BY type, recorded_at DESC`,
+        [patientId]
+      ),
+      // Today's med adherence counts
+      pool.query(
+        `SELECT
+           COUNT(*) FILTER (WHERE status='taken')  AS taken,
+           COUNT(*) FILTER (WHERE status='missed') AS missed,
+           COUNT(*)                                 AS total
+         FROM medication_logs
+         WHERE patient_id=$1
+         AND scheduled_at::date = ${bangkokDate}`,
+        [patientId]
+      ),
+      // Urgent alert count today
+      pool.query(
+        `SELECT COUNT(*) AS count FROM alerts
+         WHERE patient_id=$1 AND severity='urgent'
+         AND fired_at::date = ${bangkokDate}`,
+        [patientId]
+      ),
+    ]);
+
+    // Build vitals JSONB keyed by type
+    const vitals = {};
+    for (const row of vitalsResult.rows) {
+      vitals[row.type] = {
+        v1: parseFloat(row.value_1),
+        v2: row.value_2 ? parseFloat(row.value_2) : null,
+        unit: row.unit,
+        level: row.alert_level,
+        at: row.recorded_at,
+      };
+    }
+
+    const med = medResult.rows[0];
+    const medsToday = {
+      taken: parseInt(med.taken),
+      missed: parseInt(med.missed),
+      total: parseInt(med.total),
+    };
+    const urgentCount = parseInt(alertResult.rows[0].count);
+
+    await pool.query(
+      `INSERT INTO patient_snapshots
+         (patient_id, vitals, meds_today, urgent_count, last_updated)
+       VALUES ($1, $2, $3, $4, NOW())
+       ON CONFLICT (patient_id) DO UPDATE SET
+         vitals       = EXCLUDED.vitals,
+         meds_today   = EXCLUDED.meds_today,
+         urgent_count = EXCLUDED.urgent_count,
+         last_updated = NOW()`,
+      [patientId, JSON.stringify(vitals), JSON.stringify(medsToday), urgentCount]
+    );
+
+    console.log(`📸 Snapshot updated: patient ${patientId.slice(-6)}`);
+  } catch (err) {
+    // Non-blocking — snapshot failure must never break the main flow
+    console.error('Snapshot update failed:', err.message);
+  }
 }
 
 // ============================================================
@@ -1208,58 +1291,36 @@ async function generateDailySummary(patientId, displayName) {
   );
   if (existing.rows.length > 0) return;
 
-  // Pull today's health logs
-  const logs = await pool.query(
-    `SELECT type, value_1, value_2, unit, alert_level, recorded_at
-     FROM health_logs
-     WHERE patient_id=$1 AND confirmed=TRUE
-     AND recorded_at::date = (NOW() AT TIME ZONE 'Asia/Bangkok')::date
-     ORDER BY recorded_at`,
+  // Read directly from the real-time snapshot — no need to re-aggregate raw tables
+  const snapResult = await pool.query(
+    `SELECT vitals, meds_today, urgent_count FROM patient_snapshots WHERE patient_id=$1`,
     [patientId]
   );
+  const snap = snapResult.rows[0];
+  const vitals    = snap?.vitals    || {};
+  const meds      = snap?.meds_today || { taken: 0, missed: 0, total: 0 };
+  const urgentCount = snap?.urgent_count || 0;
 
-  // Pull today's medication adherence
-  const meds = await pool.query(
-    `SELECT m.name, ml.status, ml.scheduled_at
-     FROM medication_logs ml
-     JOIN medications m ON m.id = ml.medication_id
-     WHERE ml.patient_id=$1
-     AND ml.scheduled_at::date = (NOW() AT TIME ZONE 'Asia/Bangkok')::date
-     ORDER BY ml.scheduled_at`,
-    [patientId]
-  );
+  // Format vitals for the prompt
+  const vitalsText = Object.entries(vitals).map(([type, v]) => {
+    if (type === 'bp')      return `ความดัน ${v.v1}/${v.v2} mmHg [${v.level}]`;
+    if (type === 'glucose') return `น้ำตาล ${v.v1} mg/dL [${v.level}]`;
+    if (type === 'spo2')    return `ออกซิเจน ${v.v1}% [${v.level}]`;
+    if (type === 'temp')    return `อุณหภูมิ ${v.v1}°C [${v.level}]`;
+    if (type === 'weight')  return `น้ำหนัก ${v.v1} กก${v.v2 ? ` (${v.v2 > 0 ? '+' : ''}${v.v2} กก)` : ''} [${v.level}]`;
+    return `${type} ${v.v1}`;
+  }).join(', ') || 'ไม่มีการบันทึกค่าสุขภาพวันนี้';
 
-  // Pull today's alerts
-  const alerts = await pool.query(
-    `SELECT type, severity, fired_at
-     FROM alerts
-     WHERE patient_id=$1
-     AND fired_at::date = (NOW() AT TIME ZONE 'Asia/Bangkok')::date`,
-    [patientId]
-  );
-
-  // Build context for Haiku
-  const logsText = logs.rows.length > 0
-    ? logs.rows.map(l => {
-        if (l.type === 'bp') return `ความดัน ${l.value_1}/${l.value_2} mmHg [${l.alert_level}]`;
-        if (l.type === 'glucose') return `น้ำตาล ${l.value_1} mg/dL [${l.alert_level}]`;
-        if (l.type === 'spo2') return `ออกซิเจน ${l.value_1}% [${l.alert_level}]`;
-        if (l.type === 'temp') return `อุณหภูมิ ${l.value_1}°C [${l.alert_level}]`;
-        if (l.type === 'weight') return `น้ำหนัก ${l.value_1} กก (เปลี่ยน ${l.value_2 > 0 ? '+' : ''}${l.value_2} กก) [${l.alert_level}]`;
-        return `${l.type} ${l.value_1}`;
-      }).join(', ')
-    : 'ไม่มีการบันทึกค่าสุขภาพวันนี้';
-
-  const medsText = meds.rows.length > 0
-    ? meds.rows.map(m => `${m.name}: ${m.status}`).join(', ')
+  const medsText = meds.total > 0
+    ? `กิน ${meds.taken}/${meds.total} ครั้ง${meds.missed > 0 ? ` (ลืม ${meds.missed} ครั้ง)` : ''}`
     : 'ไม่มีรายการยาวันนี้';
 
-  const alertsText = alerts.rows.length > 0
-    ? alerts.rows.map(a => `${a.type} (${a.severity})`).join(', ')
+  const alertsText = urgentCount > 0
+    ? `มีการแจ้งเตือนเร่งด่วน ${urgentCount} รายการ`
     : 'ไม่มีการแจ้งเตือน';
 
   const prompt = `สรุปสุขภาพประจำวันของ ${displayName || 'ผู้ป่วย'} วันที่ ${dateStr}:
-ค่าสุขภาพ: ${logsText}
+ค่าสุขภาพ: ${vitalsText}
 ยา: ${medsText}
 การแจ้งเตือน: ${alertsText}
 
@@ -1271,7 +1332,8 @@ async function generateDailySummary(patientId, displayName) {
     messages: [{ role: 'user', content: prompt }],
   });
 
-  const summary = response.content.find(b => b.type === 'text')?.text ?? 'ไม่มีข้อมูลเพียงพอในการสรุปวันนี้ครับ';
+  const summary = response.content.find(b => b.type === 'text')?.text
+    ?? 'ไม่มีข้อมูลเพียงพอในการสรุปวันนี้ครับ';
 
   await pool.query(
     `INSERT INTO daily_summaries (patient_id, summary_date, summary_text)
@@ -1599,97 +1661,78 @@ async function buildDashboardCard(guardianLineUserId) {
      WHERE g.line_user_id = $1`,
     [guardianLineUserId]
   );
-
   if (patients.rows.length === 0) return null;
 
+  const bangkokToday = new Date(Date.now() + 7 * 3600000).toISOString().split('T')[0];
   const bubbles = [];
 
   for (const patient of patients.rows) {
     const name = patient.display_name || 'ผู้ป่วย';
 
-    // Get today's summary
-    const bangkokToday = new Date(Date.now() + 7 * 3600000).toISOString().split('T')[0];
-    const summary = await pool.query(
-      `SELECT summary_text, generated_at FROM daily_summaries
-       WHERE patient_id=$1 AND summary_date=$2`,
-      [patient.id, bangkokToday]
-    );
+    // ── Single query: snapshot + today's prose summary ──────
+    const [snapResult, summaryResult] = await Promise.all([
+      pool.query(
+        `SELECT vitals, meds_today, urgent_count, last_updated
+         FROM patient_snapshots WHERE patient_id=$1`,
+        [patient.id]
+      ),
+      pool.query(
+        `SELECT summary_text, generated_at FROM daily_summaries
+         WHERE patient_id=$1 AND summary_date=$2`,
+        [patient.id, bangkokToday]
+      ),
+    ]);
 
-    // Get today's latest vitals
-    const vitals = await pool.query(
-      `SELECT DISTINCT ON (type) type, value_1, value_2, alert_level, recorded_at
-       FROM health_logs
-       WHERE patient_id=$1 AND confirmed=TRUE
-       AND recorded_at::date = (NOW() AT TIME ZONE 'Asia/Bangkok')::date
-       ORDER BY type, recorded_at DESC`,
-      [patient.id]
-    );
+    const snap = snapResult.rows[0];
+    const vitals = snap?.vitals || {};
+    const meds   = snap?.meds_today || { taken: 0, missed: 0, total: 0 };
+    const urgentCount = snap?.urgent_count || 0;
+    const lastUpdated = snap?.last_updated
+      ? new Date(new Date(snap.last_updated).getTime() + 7 * 3600000)
+          .toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' })
+      : null;
 
-    // Get today's medication adherence
-    const medStats = await pool.query(
-      `SELECT
-         COUNT(*) FILTER (WHERE status='taken') as taken,
-         COUNT(*) FILTER (WHERE status='missed') as missed,
-         COUNT(*) as total
-       FROM medication_logs
-       WHERE patient_id=$1
-       AND scheduled_at::date = (NOW() AT TIME ZONE 'Asia/Bangkok')::date`,
-      [patient.id]
-    );
-
-    // Get unnotified alerts today
-    const alertCount = await pool.query(
-      `SELECT COUNT(*) as count FROM alerts
-       WHERE patient_id=$1 AND severity='urgent'
-       AND fired_at::date = (NOW() AT TIME ZONE 'Asia/Bangkok')::date`,
-      [patient.id]
-    );
-
-    const stats = medStats.rows[0];
-    const urgentCount = parseInt(alertCount.rows[0].count);
     const headerColor = urgentCount > 0 ? '#FF4444' : '#06C755';
-    const headerText = urgentCount > 0 ? `🚨 ${name} — มีการแจ้งเตือน` : `✅ ${name}`;
+    const headerText  = urgentCount > 0 ? `🚨 ${name} — มีการแจ้งเตือน` : `✅ ${name}`;
 
-    // Build vital rows
-    const vitalRows = vitals.rows.map(v => {
-      const alertIcon = v.alert_level === 'urgent' ? ' 🚨' : v.alert_level === 'watch' ? ' ⚠️' : '';
-      let label = '', value = '';
-      if (v.type === 'bp') { label = 'ความดัน'; value = `${v.value_1}/${v.value_2} mmHg${alertIcon}`; }
-      else if (v.type === 'glucose') { label = 'น้ำตาล'; value = `${v.value_1} mg/dL${alertIcon}`; }
-      else if (v.type === 'spo2') { label = 'ออกซิเจน'; value = `${v.value_1}%${alertIcon}`; }
-      else if (v.type === 'temp') { label = 'อุณหภูมิ'; value = `${v.value_1}°C${alertIcon}`; }
-      else if (v.type === 'weight') { label = 'น้ำหนัก'; value = `${v.value_1} กก${v.value_2 ? ` (${v.value_2 > 0 ? '+' : ''}${v.value_2})` : ''}${alertIcon}`; }
+    // Build vital rows from snapshot JSONB
+    const VITAL_LABELS = { bp: 'ความดัน', glucose: 'น้ำตาล', spo2: 'ออกซิเจน', temp: 'อุณหภูมิ', weight: 'น้ำหนัก' };
+    const vitalRows = Object.entries(vitals).map(([type, v]) => {
+      const alertIcon = v.level === 'urgent' ? ' 🚨' : v.level === 'watch' ? ' ⚠️' : '';
+      let value = '';
+      if (type === 'bp')      value = `${v.v1}/${v.v2} mmHg${alertIcon}`;
+      else if (type === 'glucose') value = `${v.v1} mg/dL${alertIcon}`;
+      else if (type === 'spo2')    value = `${v.v1}%${alertIcon}`;
+      else if (type === 'temp')    value = `${v.v1}°C${alertIcon}`;
+      else if (type === 'weight')  value = `${v.v1} กก${v.v2 ? ` (${v.v2 > 0 ? '+' : ''}${v.v2})` : ''}${alertIcon}`;
       return {
         type: 'box', layout: 'horizontal',
         contents: [
-          { type: 'text', text: label, size: 'sm', color: '#888888', flex: 2 },
+          { type: 'text', text: VITAL_LABELS[type] || type, size: 'sm', color: '#888888', flex: 2 },
           { type: 'text', text: value, size: 'sm', color: '#1a1a1a', flex: 3, align: 'end', wrap: true },
         ],
         paddingTop: '6px', paddingBottom: '6px',
       };
     });
 
-    // Medication adherence row
     const medRow = {
       type: 'box', layout: 'horizontal',
       contents: [
         { type: 'text', text: 'ยา', size: 'sm', color: '#888888', flex: 2 },
         { type: 'text',
-          text: stats.total > 0 ? `กิน ${stats.taken}/${stats.total} ครั้ง` : 'ไม่มียาวันนี้',
-          size: 'sm', color: stats.missed > 0 ? '#FF6B35' : '#1a1a1a', flex: 3, align: 'end' },
+          text: meds.total > 0 ? `กิน ${meds.taken}/${meds.total} ครั้ง` : 'ไม่มียาวันนี้',
+          size: 'sm', color: meds.missed > 0 ? '#FF6B35' : '#1a1a1a', flex: 3, align: 'end' },
       ],
       paddingTop: '6px', paddingBottom: '6px',
     };
 
-    // Summary text
-    const summaryText = summary.rows.length > 0
-      ? summary.rows[0].summary_text
+    const summaryText = summaryResult.rows.length > 0
+      ? summaryResult.rows[0].summary_text
       : 'ยังไม่มีสรุปวันนี้ครับ (จะสรุปเวลา 20:00 น.)';
-
-    const generatedTime = summary.rows.length > 0
-      ? new Date(new Date(summary.rows[0].generated_at).getTime() + 7 * 3600000)
+    const summaryTime = summaryResult.rows.length > 0
+      ? new Date(new Date(summaryResult.rows[0].generated_at).getTime() + 7 * 3600000)
           .toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' })
-      : '';
+      : null;
 
     bubbles.push({
       type: 'bubble', size: 'kilo',
@@ -1701,19 +1744,20 @@ async function buildDashboardCard(guardianLineUserId) {
       body: {
         type: 'box', layout: 'vertical', spacing: 'none',
         contents: [
-          // Vitals section
           ...(vitalRows.length > 0 ? [
             { type: 'text', text: '📊 ค่าสุขภาพวันนี้', size: 'xs', color: '#888888', weight: 'bold', margin: 'none' },
             ...vitalRows,
             { type: 'separator', margin: 'md' },
-          ] : [{ type: 'text', text: 'ยังไม่มีค่าสุขภาพวันนี้', size: 'sm', color: '#999999' }, { type: 'separator', margin: 'md' }]),
-          // Medication row
+          ] : [
+            { type: 'text', text: 'ยังไม่มีค่าสุขภาพวันนี้', size: 'sm', color: '#999999' },
+            { type: 'separator', margin: 'md' },
+          ]),
           medRow,
           { type: 'separator', margin: 'md' },
-          // AI summary
           { type: 'text', text: '💬 สรุปวันนี้', size: 'xs', color: '#888888', weight: 'bold', margin: 'md' },
           { type: 'text', text: summaryText, size: 'sm', color: '#333333', wrap: true, margin: 'sm' },
-          ...(generatedTime ? [{ type: 'text', text: `อัปเดต ${generatedTime} น.`, size: 'xs', color: '#bbbbbb', margin: 'sm' }] : []),
+          ...(summaryTime ? [{ type: 'text', text: `สรุปเมื่อ ${summaryTime} น.`, size: 'xs', color: '#bbbbbb', margin: 'sm' }] : []),
+          ...(lastUpdated ? [{ type: 'text', text: `ข้อมูลล่าสุด ${lastUpdated} น.`, size: 'xs', color: '#bbbbbb', margin: 'xs' }] : []),
         ],
         paddingAll: '12px',
       },
@@ -1723,11 +1767,7 @@ async function buildDashboardCard(guardianLineUserId) {
   if (bubbles.length === 1) {
     return { type: 'flex', altText: 'แดชบอร์ดสุขภาพ', contents: bubbles[0] };
   }
-
-  return {
-    type: 'flex', altText: 'แดชบอร์ดสุขภาพ',
-    contents: { type: 'carousel', contents: bubbles },
-  };
+  return { type: 'flex', altText: 'แดชบอร์ดสุขภาพ', contents: { type: 'carousel', contents: bubbles } };
 }
 
 // ============================================================
@@ -2142,6 +2182,8 @@ async function handleTextMessage(event, patientId) {
       );
     }
     medCache.delete(patientId);
+    // Update snapshot so dashboard reflects taken status immediately (non-blocking)
+    updateSnapshot(patientId);
     // Fall through to Claude for the warm acknowledgement reply
   }
 
