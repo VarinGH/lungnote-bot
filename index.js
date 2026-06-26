@@ -60,37 +60,6 @@ const TIME_LABELS = {
 };
 
 // ============================================================
-// INTENT CLASSIFIER — uses Haiku for onboarding state machine
-// ============================================================
-
-async function classifyIntent(text, context) {
-  const prompts = {
-    done_or_more:
-      `User said: "${text}"\nAre they saying they are DONE (finished, no more, that's all, แค่นี้, พอแล้ว, เท่านี้, ok) or do they have MORE items?\nReply with exactly one word: DONE, MORE, or OTHER`,
-    mode_choice:
-      `User said: "${text}"\nAre they saying they want this app for THEMSELVES (self, solo, ตัวเอง) or for a FAMILY member (parent, spouse, พ่อแม่, คนอื่น)?\nReply with exactly one word: SELF, FAMILY, or UNCLEAR`,
-    has_conditions:
-      `User said: "${text}"\nAre they listing medical conditions or saying they have NONE (ไม่มี, ไม่เป็น, สบายดี)?\nReply with exactly one word: HAS_CONDITIONS, NO_CONDITIONS, or UNCLEAR`,
-    has_meds:
-      `User said: "${text}"\nAre they saying they HAVE medications (yes, มี, มียา) or NO medications (ไม่มี, ไม่ได้กิน)? Or do they want to use a PHOTO?\nReply with exactly one word: HAS_MEDS, NO_MEDS, PHOTO, or UNCLEAR`,
-    correct_or_edit:
-      `User said: "${text}"\nAre they saying the information is CORRECT (ถูก, ใช่, ok, โอเค, ถูกต้อง) or do they want to EDIT (ผิด, แก้, เปลี่ยน)?\nReply with exactly one word: CORRECT, EDIT, or UNCLEAR`,
-  };
-
-  try {
-    const response = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 10,
-      messages: [{ role: 'user', content: prompts[context] }],
-    });
-    return response.content.find(b => b.type === 'text')?.text?.trim().toUpperCase() || 'UNCLEAR';
-  } catch (err) {
-    console.error('Intent classification failed:', err.message);
-    return 'UNCLEAR';
-  }
-}
-
-// ============================================================
 // MASTER INTENT ROUTER — runs on every post-onboarding message
 // Single Haiku call replaces all keyword matching in handleTextMessage.
 // Returns { intent, entities } where intent is one of:
@@ -190,63 +159,6 @@ Message: "${text}"` }],
     console.error('parseMealTimes failed:', err.message);
     return MEAL_DEFAULTS;
   }
-}
-
-const SHORTHAND_TIMES = {
-  'วันละครั้ง':        ['08:00'],
-  'วันละ1ครั้ง':       ['08:00'],
-  'วันละ 1 ครั้ง':     ['08:00'],
-  'เช้าเย็น':          ['08:00', '18:00'],
-  'เช้ากลางวันเย็น':   ['08:00', '12:00', '18:00'],
-  'เช้า กลางวัน เย็น': ['08:00', '12:00', '18:00'],
-  'สามมื้อ':           ['08:00', '12:00', '18:00'],
-  '3มื้อ':             ['08:00', '12:00', '18:00'],
-  'เช้าเย็นก่อนนอน':  ['08:00', '18:00', '21:00'],
-};
-
-const SINGLE_TIMES = {
-  'เช้า': '08:00', 'กลางวัน': '12:00', 'เที่ยง': '12:00',
-  'บ่าย': '14:00', 'เย็น': '18:00', 'ก่อนนอน': '21:00',
-  'นอน': '21:00', 'กลางคืน': '21:00', 'ดึก': '22:00',
-};
-
-function hasTimeInfo(text) {
-  const hasExplicit = /\b([0-9]{1,2}:[0-9]{2})\b/.test(text);
-  const hasShorthand = Object.keys(SHORTHAND_TIMES).some(k => text.includes(k));
-  const hasSingle = Object.keys(SINGLE_TIMES).some(k => text.includes(k));
-  return hasExplicit || hasShorthand || hasSingle;
-}
-
-function parseMedication(text) {
-  let schedule = [];
-
-  for (const [pattern, times] of Object.entries(SHORTHAND_TIMES)) {
-    if (text.includes(pattern)) { schedule = [...times]; break; }
-  }
-  if (schedule.length === 0) {
-    for (const [word, time] of Object.entries(SINGLE_TIMES)) {
-      if (text.includes(word) && !schedule.includes(time)) schedule.push(time);
-    }
-  }
-  const explicit = text.match(/\b([0-9]{1,2}:[0-9]{2})\b/g);
-  if (explicit) explicit.forEach(t => { const p = t.padStart(5,'0'); if (!schedule.includes(p)) schedule.push(p); });
-  if (schedule.length === 0) schedule = ['08:00'];
-  schedule.sort();
-
-  const dosageMatch = text.match(/(\d+(?:\.\d+)?)\s*(mg|mcg|ml|เม็ด|แคปซูล|ช้อน|ซีซี)/i);
-  const dosage = dosageMatch ? `${dosageMatch[1]}${dosageMatch[2]}` : null;
-
-  let name = text
-    .replace(/\d+(?:\.\d+)?\s*(mg|mcg|ml|เม็ด|แคปซูล|ช้อน|ซีซี)/gi, '')
-    .replace(/วันละ\s*\d+\s*ครั้ง/g, '')
-    .replace(/กิน|ทาน|รับประทาน|ยา/g, '')
-    .replace(new RegExp(Object.keys(SHORTHAND_TIMES).join('|'), 'g'), '')
-    .replace(new RegExp(Object.keys(SINGLE_TIMES).join('|'), 'g'), '')
-    .replace(/\b([0-9]{1,2}:[0-9]{2})\b/g, '')
-    .replace(/\s+/g, ' ').trim();
-  if (!name || name.length < 2) name = text.split(' ')[0];
-
-  return { name, dosage, schedule };
 }
 
 function formatMed(med) {
@@ -627,18 +539,297 @@ async function setOnboardingState(patientId, state) {
   await pool.query(`UPDATE patients SET onboarding_state = $1 WHERE id = $2`, [state, patientId]);
 }
 
+// ============================================================
+// NATURAL-LANGUAGE ONBOARDING (slot-filling)
+// ------------------------------------------------------------
+// Instead of a rigid question-per-state machine, we keep a small
+// "profile" of what we still need and, on every message, ask Claude
+// to extract whatever it can from the user's free text into that
+// profile. A deterministic nextStep() then decides what to ask next
+// based only on which slots are still empty — not on a fixed script.
+//
+// This makes the flow tolerant of:
+//   • out-of-order info ("I'm John and I take amlodipine each morning")
+//   • misspellings / unexpected phrasing (Claude reads intent, not keywords)
+//   • the user volunteering several meds at once
+//
+// Clinical writes (medication name/dose/schedule) are extracted by the LLM
+// (extractOnboardingInfo), validated by normalizeSchedule/medFromExtraction,
+// saved via saveMedicationToDB, and are ALWAYS shown back as a list for
+// confirmation before we finish.
+// ============================================================
+
+// In-memory working profile for an in-progress onboarding.
+// Keyed by patientId. Short-lived (one onboarding session).
+// The authoritative copy of saved meds always lives in the DB; this map
+// only holds the conversational scratch state. If the process restarts
+// mid-onboarding, we rebuild what we can from the patients row + meds table.
+const onboardingProfiles = new Map();
+
+function freshProfile() {
+  return {
+    language: null,        // 'th' | 'en'
+    care_mode: null,       // 'self' | 'family'
+    self_name: null,       // name of the guardian (family mode) or the user (self mode)
+    patient_name: null,    // name of the person being cared for
+    conditions: null,      // string | 'none'
+    meal_raw: null,        // raw text the user gave about meal/med times
+    meal_times: null,      // { morning, midday, evening, bedtime }
+    meds_done: false,      // user has indicated they finished listing meds
+    confirmed: null,       // true once they confirm the med list is correct
+    // pending single med awaiting a time (when they gave a name but no time)
+    pending_med: null,     // { name, dosage }
+  };
+}
+
+async function getProfile(patient) {
+  let p = onboardingProfiles.get(patient.id);
+  if (p) return p;
+
+  p = freshProfile();
+
+  // Only rebuild from the DB row if onboarding was genuinely in progress
+  // (e.g. the process restarted mid-flow). For brand-new patients the
+  // patients row still holds the INSERT defaults (language='th',
+  // care_mode='self'), which must NOT be mistaken for real answers — we
+  // still want to ask language and who-it's-for.
+  const midFlow = patient.onboarding_state === 'in_progress';
+  if (midFlow) {
+    p.language = patient.language || null;
+    p.care_mode = patient.care_mode === 'family' ? 'family'
+      : patient.care_mode === 'self' ? 'self' : null;
+    if (patient.display_name) {
+      if (p.care_mode === 'family') p.patient_name = patient.display_name;
+      else p.self_name = patient.display_name;
+    }
+    if (patient.conditions) p.conditions = patient.conditions;
+    if (patient.meal_morning) {
+      p.meal_times = {
+        morning: String(patient.meal_morning).slice(0,5),
+        midday:  String(patient.meal_midday  || '12:00').slice(0,5),
+        evening: String(patient.meal_evening || '18:00').slice(0,5),
+        bedtime: String(patient.meal_bedtime || '21:00').slice(0,5),
+      };
+    }
+    if (patient.pending_med_name) {
+      p.pending_med = { name: patient.pending_med_name, dosage: patient.pending_med_dosage || null };
+    }
+  }
+
+  p._lineUserId = patient.line_user_id;
+  onboardingProfiles.set(patient.id, p);
+  return p;
+}
+
+function clearProfile(patientId) {
+  onboardingProfiles.delete(patientId);
+}
+
+// ------------------------------------------------------------
+// Extractor: one Claude call that reads the message + current profile
+// and returns any new facts as strict JSON, including structured
+// medication data (name/dose/schedule), validated downstream by
+// normalizeSchedule/medFromExtraction before anything is saved.
+// ------------------------------------------------------------
+async function extractOnboardingInfo(text, profile, step) {
+  const known = {
+    language: profile.language,
+    care_mode: profile.care_mode,
+    self_name: profile.self_name,
+    patient_name: profile.patient_name,
+    conditions: profile.conditions,
+    meal_times_known: !!profile.meal_times,
+    waiting_for: step,
+  };
+
+  const prompt = `You are the onboarding extractor for a Thai elderly-health LINE assistant ("ลุงโน้ต").
+A user is being onboarded. Read their latest message and pull out any information relevant to the fields below.
+Do NOT guess or invent. Only fill a field if the message clearly provides it. Leave everything else null.
+
+What we already know (for context — do not repeat unless the user is changing it):
+${JSON.stringify(known, null, 2)}
+
+We are currently waiting for: "${step}"
+
+User's latest message: "${text}"
+
+Reply with ONLY this JSON (no prose, no markdown):
+{
+  "language": "th" | "en" | null,            // only if they clearly pick a language
+  "care_mode": "self" | "family" | null,      // self = for themselves; family = caring for a parent/relative
+  "self_name": string | null,                 // the speaker's own name
+  "patient_name": string | null,              // name of the person they care for (family mode)
+  "conditions": string | null,                // medical conditions, or "none" if they say they have none
+  "mentions_meal_times": boolean,             // true if message describes meal/medication times of day
+  "wants_photo": boolean,                      // true if they want to send a photo of a medicine label
+  "no_medications": boolean,                   // true if they clearly have NO regular medications
+  "done_listing_meds": boolean,                // true if they signal they've finished listing medications
+  "confirms_correct": boolean,                 // true if confirming shown info is correct
+  "wants_edit": boolean,                       // true if they say shown info is wrong / want to change it
+  "looks_like_medication": boolean,           // true if the message names a medication to add
+  "medication": {                              // present ONLY when looks_like_medication is true
+    "name": string,                            // drug name, no dose or time words in it
+    "dosage": string | null,                   // e.g. "5mg", "500mg", "1 เม็ด", or null if not stated
+    "schedule": string[],                      // anchor times the drug is taken (see ANCHOR TIMES below); [] if no time was given
+    "time_given": boolean                      // true if the message stated WHEN to take it
+  } | null,
+  "schedule_reply": string[] | null            // when we're waiting for a time and the user replies ONLY with a time
+                                               // (e.g. "morning and evening", "เช้าเย็น"), the anchor times; else null
+}
+
+ANCHOR TIMES — schedule and schedule_reply MUST use only these exact strings:
+  "08:00" = morning / เช้า / after breakfast
+  "12:00" = midday / noon / lunch / เที่ยง / กลางวัน
+  "14:00" = afternoon / บ่าย
+  "18:00" = evening / dinner / เย็น / โมงเย็น
+  "21:00" = bedtime / night / ก่อนนอน / 3 ทุ่ม
+  "22:00" = late night / ดึก / 4 ทุ่ม
+Map natural phrases to the nearest anchor. Examples:
+  "twice a day, morning and night" => ["08:00","21:00"]
+  "three times a day" / "เช้ากลางวันเย็น" / "3 มื้อ" => ["08:00","12:00","18:00"]
+  "once daily" / "วันละครั้ง" => ["08:00"]
+  "เช้าเย็น" => ["08:00","18:00"]
+  "after every meal" => ["08:00","12:00","18:00"]
+  "8am and 8pm" => ["08:00","20:00"]   // if an exact non-anchor time is given, use that exact "HH:MM"
+
+Guidance:
+- Thai "ตัวเอง/ดูแลตัวเอง/เอง" => care_mode "self"; "พ่อ/แม่/ดูแลพ่อแม่/คนอื่น/ให้ท่าน" => "family".
+- "ไม่มี/ไม่เป็นอะไร/สบายดี" for conditions => conditions "none".
+- "ไม่มียา/ไม่ได้กินยา" => no_medications true.
+- "หมดแล้ว/เท่านี้/พอแล้ว/ครบแล้ว/แค่นี้/all done/done/that's all" when listing meds => done_listing_meds true.
+- "ถูก/ใช่/โอเค/ถูกต้องแล้ว/correct/ok" when confirming => confirms_correct true.
+- "ผิด/แก้/เปลี่ยน/ไม่ถูก/edit/wrong" => wants_edit true.
+- A drug name (Thai or English), possibly with a dose and/or a time => looks_like_medication true AND fill "medication".
+- If the drug message also says when to take it (e.g. "Metformin 500mg morning"), set medication.time_given=true and fill medication.schedule. If only a name/dose with no time, time_given=false and schedule=[].
+- IMPORTANT: never put dose or time words inside medication.name. "Metformin 500mg morning" => name "Metformin", dosage "500mg", schedule ["08:00"], time_given true.
+- A single message can fill several fields at once. Fill all that clearly apply.`;
+
+  try {
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 400,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const raw = response.content.find(b => b.type === 'text')?.text?.trim() || '{}';
+    const m = raw.match(/\{[\s\S]*\}/);
+    if (!m) return {};
+    return JSON.parse(m[0]);
+  } catch (err) {
+    console.error('Onboarding extractor failed:', err.message);
+    return {};
+  }
+}
+
+// Determine which slot we still need. Returns a step string used both
+// Validate/normalize a schedule the LLM returned. Keeps only sane values:
+// known anchor slots, or any explicit "HH:MM". Falls back to ['08:00'] when
+// a schedule is required but empty/garbage — never saves an invalid time.
+const ANCHOR_SLOTS = new Set(['08:00','12:00','14:00','18:00','21:00','22:00']);
+function normalizeSchedule(arr) {
+  if (!Array.isArray(arr)) return [];
+  const out = [];
+  for (let t of arr) {
+    if (typeof t !== 'string') continue;
+    t = t.trim();
+    // accept anchor slots and any valid HH:MM (00:00–23:59)
+    if (ANCHOR_SLOTS.has(t)) { if (!out.includes(t)) out.push(t); continue; }
+    const m = t.match(/^(\d{1,2}):(\d{2})$/);
+    if (m) {
+      const h = parseInt(m[1]), min = parseInt(m[2]);
+      if (h < 0 || h > 23 || min < 0 || min > 59) continue; // reject invalid times
+      const v = `${String(h).padStart(2,'0')}:${String(min).padStart(2,'0')}`;
+      if (!out.includes(v)) out.push(v);
+    }
+  }
+  out.sort();
+  return out;
+}
+
+// Build a clean med object from the extractor's `medication` field.
+// Returns { name, dosage, schedule, timeGiven } or null if unusable.
+function medFromExtraction(info) {
+  const m = info?.medication;
+  if (!m || typeof m.name !== 'string' || m.name.trim().length < 2) return null;
+  const schedule = normalizeSchedule(m.schedule);
+  return {
+    name: m.name.trim(),
+    dosage: (m.dosage && String(m.dosage).trim()) || null,
+    schedule,
+    timeGiven: !!m.time_given && schedule.length > 0,
+  };
+}
+
+// Determine which slot we still need. Returns a step string used both
+// to drive the next question and to give the extractor context.
+// `medCount` (optional) lets us skip the confirm card when there are no meds.
+function nextStep(profile, medCount = null) {
+  if (!profile.language) return 'language';
+  if (!profile.self_name) return 'self_name';
+  if (!profile.care_mode) return 'care_mode';
+  if (profile.care_mode === 'family' && !profile.patient_name) return 'patient_name';
+  if (profile.conditions === null) return 'conditions';
+  if (!profile.meal_times) return 'meal_times';
+  if (profile.pending_med) return 'med_time';      // a named med is waiting for its time
+  if (!profile.meds_done) return 'medications';
+  // If they finished with zero meds, there's nothing to confirm → complete.
+  if (medCount === 0) return 'complete';
+  if (profile.confirmed !== true) return 'confirm';
+  return 'complete';
+}
+
+// Persist whatever slots are now known to the patients row, so the rest
+// of the app (crons, dashboard, system prompt) sees them immediately.
+async function persistProfile(patientId, profile, lineUserId) {
+  // care_mode + name
+  if (profile.care_mode === 'self' && profile.self_name) {
+    await pool.query(`UPDATE patients SET care_mode='self', display_name=$1 WHERE id=$2`, [profile.self_name, patientId]);
+  } else if (profile.care_mode === 'family' && profile.patient_name) {
+    await pool.query(`UPDATE patients SET care_mode='family', display_name=$1 WHERE id=$2`, [profile.patient_name, patientId]);
+  }
+  if (profile.language) {
+    await pool.query(`UPDATE patients SET language=$1 WHERE id=$2`, [profile.language, patientId]);
+  }
+  if (profile.conditions !== null) {
+    const cond = profile.conditions === 'none' ? null : profile.conditions;
+    await pool.query(`UPDATE patients SET conditions=$1 WHERE id=$2`, [cond, patientId]);
+  }
+  if (profile.meal_times) {
+    const t = profile.meal_times;
+    await pool.query(
+      `UPDATE patients SET meal_morning=$1, meal_midday=$2, meal_evening=$3, meal_bedtime=$4 WHERE id=$5`,
+      [t.morning, t.midday, t.evening, t.bedtime, patientId]
+    );
+  }
+}
+
+// When the user switches into family mode, make sure a household + guardian
+// record exists (mirrors the old asking_mode FAMILY branch).
+async function ensureGuardianRecord(patientId, lineUserId, profile) {
+  const hhResult = await pool.query(`SELECT household_id FROM patients WHERE id=$1`, [patientId]);
+  const householdId = hhResult.rows[0].household_id;
+  await pool.query(`UPDATE households SET mode='guardian' WHERE id=$1`, [householdId]);
+  await pool.query(
+    `INSERT INTO guardians (household_id, line_user_id, display_name, notification_level, language)
+     VALUES ($1, $2, $3, 'realtime', $4)
+     ON CONFLICT (household_id) DO UPDATE SET line_user_id=$2, display_name=$3, language=$4`,
+    [householdId, lineUserId, profile.self_name || null, profile.language || 'th']
+  );
+}
+
+// ------------------------------------------------------------
+// MAIN ENTRY — replaces the old state-machine handleOnboarding.
+// Same signature & call site: handleOnboarding(event, patient).
+// ------------------------------------------------------------
 async function handleOnboarding(event, patient) {
   const { replyToken } = event;
   const text = event.message?.text?.trim() || '';
-  const { id: patientId } = patient;
+  const patientId = patient.id;
   const lineUserId = event.source.userId;
-  const state = patient.onboarding_state || 'new';
-  const l = lang(patient);
 
-  // ── new: send welcome via push (follow event already handled),
-  //   but if somehow a message arrives before language is chosen, re-ask
-  if (state === 'new') {
-    await setOnboardingState(patientId, 'asking_language');
+  const profile = await getProfile(patient);
+
+  // Very first contact (no language yet, empty message or follow): ask language.
+  if (!profile.language && !text) {
     await client.replyMessage({ replyToken, messages: [buildQuickReply(
       S('th', 'welcome_ask_lang'),
       [{ label: '🇹🇭 ภาษาไทย', text: 'ภาษาไทย' }, { label: '🇬🇧 English', text: 'English' }]
@@ -646,442 +837,336 @@ async function handleOnboarding(event, patient) {
     return;
   }
 
-  // ── asking_language: save preference, ask name ─────────────
-  if (state === 'asking_language') {
-    const isEn = /english|en\b/i.test(text) || text.trim() === 'English';
-    const isTh = /ไทย|thai/i.test(text) || text.trim() === 'ภาษาไทย';
-    if (!isEn && !isTh) {
+  // Language is special-cased with a cheap deterministic check first
+  // (the buttons send exact strings), falling back to the extractor.
+  if (!profile.language) {
+    const isEn = /english|^en$/i.test(text) || text === 'English';
+    const isTh = /ไทย|thai/i.test(text) || text === 'ภาษาไทย';
+    if (isEn || isTh) {
+      profile.language = isEn ? 'en' : 'th';
+    }
+  }
+
+  const step = nextStep(profile);
+
+  // Run the extractor for everything except the pure language pick
+  // (which we may have just resolved above). The extractor is also how
+  // we handle med names, done/confirm/edit signals, etc.
+  let info = {};
+  if (profile.language && step !== 'language') {
+    info = await extractOnboardingInfo(text, profile, step);
+  }
+
+  // ---- Merge extracted info into the profile ----
+  if (info.language && !profile.language) profile.language = info.language;
+  if (info.self_name && !profile.self_name) profile.self_name = info.self_name;
+  if (info.care_mode && !profile.care_mode) profile.care_mode = info.care_mode;
+  if (info.patient_name && profile.care_mode === 'family' && !profile.patient_name) {
+    profile.patient_name = info.patient_name;
+  }
+  if (info.conditions && profile.conditions === null) {
+    profile.conditions = info.conditions;
+  }
+
+  const l = profile.language || 'th';
+
+  // ===== Step-specific handling that needs deterministic helpers =====
+
+  // (A) Meal times — use the existing parseMealTimes() helper on the raw text.
+  if (step === 'meal_times' && info.mentions_meal_times) {
+    if (text.trim().length >= 3) {
+      profile.meal_raw = text;
+      profile.meal_times = await parseMealTimes(text);
+      profile._showMealSaved = true; // show the saved-times summary once, next turn
+      await persistProfile(patientId, profile, lineUserId);
+    }
+  }
+
+  // (B) A medication name was provided — save it (or ask its time).
+  //     Medication parsing now comes from the LLM extractor (info.medication
+  //     and info.schedule_reply), so it works the same in Thai and English
+  //     and across natural phrasings ("twice a day", "after breakfast", ...).
+  if ((step === 'medications' || step === 'med_time') &&
+      (info.looks_like_medication || step === 'med_time')) {
+    // If we were waiting for a time for a pending med, this message is the time
+    // — UNLESS the user is actually signalling they're done / want to edit, in
+    // which case we must not swallow it as a schedule. Drop the pending med
+    // (it was never given a time) and fall through to the done/edit handling.
+    if (step === 'med_time' && profile.pending_med) {
+      if (info.done_listing_meds || info.no_medications || info.wants_edit || info.confirms_correct) {
+        profile.pending_med = null;
+        await pool.query(`UPDATE patients SET pending_med_name=NULL, pending_med_dosage=NULL WHERE id=$1`, [patientId]);
+        // do not return — let the done/edit logic below run this same turn
+      } else {
+        // The reply is the time. Prefer schedule_reply; if the user instead
+        // restated the whole med, take that med's schedule.
+        let schedule = normalizeSchedule(info.schedule_reply);
+        if (schedule.length === 0) {
+          const restated = medFromExtraction(info);
+          if (restated && restated.schedule.length > 0) schedule = restated.schedule;
+        }
+        const finalSchedule = schedule.length > 0 ? schedule : ['08:00'];
+        const med = await saveMedicationToDB(patientId, profile.pending_med.name, profile.pending_med.dosage, finalSchedule);
+        profile.pending_med = null;
+        await pool.query(`UPDATE patients SET pending_med_name=NULL, pending_med_dosage=NULL WHERE id=$1`, [patientId]);
+        await persistProfile(patientId, profile, lineUserId);
+        await client.replyMessage({ replyToken, messages: [{ type: 'text',
+          text: S(l, 'med_saved', formatMed(med)) + (l === 'en' ? 'Any other medications? Tell me, or say "all done".' : 'มียาตัวอื่นอีกไหมครับ? บอกลุงได้เลย หรือพิมพ์ว่า "หมดแล้ว" ครับ') }]});
+        return;
+      }
+    }
+    // Otherwise this is a new med name in the listing phase.
+    if (info.looks_like_medication) {
+      const med0 = medFromExtraction(info);
+      if (!med0) {
+        await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'med_name_unclear') }]});
+        return;
+      }
+      if (!med0.timeGiven) {
+        // Need a time — stash as pending and ask, with quick-reply buttons.
+        profile.pending_med = { name: med0.name, dosage: med0.dosage };
+        await pool.query(`UPDATE patients SET pending_med_name=$1, pending_med_dosage=$2 WHERE id=$3`, [med0.name, med0.dosage, patientId]);
+        await client.replyMessage({ replyToken, messages: [buildQuickReply(
+          S(l, 'ask_med_time', med0.name, med0.dosage),
+          l === 'en' ? TIME_BUTTONS_EN : TIME_BUTTONS
+        )]});
+        return;
+      }
+      const med = await saveMedicationToDB(patientId, med0.name, med0.dosage, med0.schedule);
+      await client.replyMessage({ replyToken, messages: [{ type: 'text',
+        text: S(l, 'med_saved', formatMed(med)) + (l === 'en' ? 'Any others? Or say "all done".' : 'มีอีกไหมครับ? หรือพิมพ์ "หมดแล้ว" ครับ') }]});
+      return;
+    }
+  }
+
+  // From here on, treat 'medications' and 'med_time' as the same "meds area":
+  // a done/no-meds/photo signal can arrive even while a med was pending (we
+  // dropped that pending med just above), so both steps should honour them.
+  const inMedsArea = (step === 'medications' || step === 'med_time');
+
+  // (C) No-medications declaration during the meds phase.
+  if (inMedsArea && info.no_medications) {
+    profile.meds_done = true;
+  }
+
+  // (C2) User wants to photograph a label — prompt them to send it.
+  if (inMedsArea && info.wants_photo && !info.looks_like_medication && !profile.meds_done) {
+    await client.replyMessage({ replyToken, messages: [{ type: 'text',
+      text: l === 'en' ? 'Send a photo of the medicine label 📷' : 'ถ่ายรูปฉลากยามาได้เลยครับ ลุงจะอ่านและจดไว้ให้ครับ 📷' }]});
+    return;
+  }
+
+  // (D) Done listing meds.
+  if (inMedsArea && info.done_listing_meds) {
+    profile.meds_done = true;
+  }
+
+  // (E) Confirmation / edit handling while showing the list.
+  if (step === 'confirm') {
+    if (info.confirms_correct) {
+      profile.confirmed = true;
+    } else if (info.wants_edit) {
+      // Reopen the meds phase so they can add/correct, then we'll re-confirm.
+      profile.meds_done = false;
+      profile.confirmed = null;
+      await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'edit_meds') }]});
+      return;
+    } else if (info.looks_like_medication) {
+      // They typed another med at the confirm screen — treat as an addition.
+      profile.meds_done = false;
+      profile.confirmed = null;
+      const med0 = medFromExtraction(info);
+      if (med0) {
+        if (!med0.timeGiven) {
+          profile.pending_med = { name: med0.name, dosage: med0.dosage };
+          await pool.query(`UPDATE patients SET pending_med_name=$1, pending_med_dosage=$2 WHERE id=$3`, [med0.name, med0.dosage, patientId]);
+          await client.replyMessage({ replyToken, messages: [buildQuickReply(
+            S(l, 'ask_med_time', med0.name, med0.dosage), l === 'en' ? TIME_BUTTONS_EN : TIME_BUTTONS)]});
+          return;
+        }
+        const med = await saveMedicationToDB(patientId, med0.name, med0.dosage, med0.schedule);
+        await client.replyMessage({ replyToken, messages: [{ type: 'text',
+          text: S(l, 'med_saved', formatMed(med)) + (l === 'en' ? 'Any others? Or say "all done".' : 'มีอีกไหมครับ? หรือพิมพ์ "หมดแล้ว" ครับ') }]});
+        return;
+      }
+    }
+  }
+
+  // Persist any newly-learned simple slots before deciding what to ask next.
+  await persistProfile(patientId, profile, lineUserId);
+
+  // If the user just switched into family mode, make sure guardian record exists.
+  if (profile.care_mode === 'family') {
+    await ensureGuardianRecord(patientId, lineUserId, profile);
+  }
+
+  // ===== Decide & ask the next thing =====
+  await advanceOnboarding(replyToken, patient, profile);
+}
+
+// ------------------------------------------------------------
+// advanceOnboarding: look at the profile, ask for the next empty slot,
+// or finish. Centralises the "what do we say now" logic so both text and
+// photo handlers can call it.
+// ------------------------------------------------------------
+async function advanceOnboarding(replyToken, patient, profile) {
+  const patientId = patient.id;
+  const lineUserId = patient.line_user_id || (profile._lineUserId);
+  const l = profile.language || 'th';
+
+  // If meds are done, we need the count to decide confirm vs. complete.
+  let medCount = null;
+  if (profile.meds_done && !profile.pending_med) {
+    const c = await pool.query(`SELECT COUNT(*) FROM medications WHERE patient_id=$1 AND active=TRUE`, [patientId]);
+    medCount = parseInt(c.rows[0].count);
+  }
+  const step = nextStep(profile, medCount);
+
+  // Mirror completion into the DB column so needsOnboarding() works.
+  // While in progress we store a single 'in_progress' sentinel — the
+  // detailed step lives in the in-memory profile, not the column.
+  if (step !== 'complete') {
+    await setOnboardingState(patientId, 'in_progress').catch(() => {});
+  }
+
+  switch (step) {
+    case 'language':
       await client.replyMessage({ replyToken, messages: [buildQuickReply(
         S('th', 'welcome_ask_lang'),
         [{ label: '🇹🇭 ภาษาไทย', text: 'ภาษาไทย' }, { label: '🇬🇧 English', text: 'English' }]
       )]});
       return;
-    }
-    const chosenLang = isEn ? 'en' : 'th';
-    await pool.query(`UPDATE patients SET language=$1, onboarding_state='asking_name' WHERE id=$2`, [chosenLang, patientId]);
-    // Re-read patient with updated language for S() calls below
-    patient.language = chosenLang;
-    const l2 = chosenLang;
-    await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l2, 'ask_name') }]});
-    return;
-  }
 
-  // ── asking_name: save name + ask mode ─────────────────────
-  if (state === 'asking_name') {
-    if (!text || text.length < 1) {
-      await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'name_retry') }]});
+    case 'self_name':
+      await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'ask_name') }]});
       return;
-    }
-    await pool.query(`UPDATE patients SET display_name = $1 WHERE id = $2`, [text, patientId]);
-    await setOnboardingState(patientId, 'asking_mode');
-    await client.replyMessage({ replyToken, messages: [buildQuickReply(
-      S(l, 'ask_mode', text),
-      S(l, 'mode_buttons')
-    )]});
-    return;
-  }
 
-  // ── asking_mode: classify intent + branch ─────────────────
-  if (state === 'asking_mode') {
-    const intent = await classifyIntent(text, 'mode_choice');
-    if (intent === 'UNCLEAR') {
-      await client.replyMessage({ replyToken, messages: [buildQuickReply(S(l, 'mode_unclear'), S(l, 'mode_buttons'))]});
+    case 'care_mode':
+      await client.replyMessage({ replyToken, messages: [buildQuickReply(
+        S(l, 'ask_mode', profile.self_name || ''),
+        S(l, 'mode_buttons')
+      )]});
       return;
-    }
-    if (intent === 'FAMILY') {
-      const hhResult = await pool.query(`SELECT household_id FROM patients WHERE id=$1`, [patientId]);
-      const householdId = hhResult.rows[0].household_id;
-      await pool.query(`UPDATE households SET mode='guardian' WHERE id=$1`, [householdId]);
-      await pool.query(
-        `INSERT INTO guardians (household_id, line_user_id, display_name, notification_level, language)
-         VALUES ($1, $2, $3, 'realtime', $4)
-         ON CONFLICT (household_id) DO UPDATE SET line_user_id=$2, language=$4`,
-        [householdId, lineUserId, patient.display_name, l]
-      );
-      await setOnboardingState(patientId, 'guardian_asking_patient_name');
+
+    case 'patient_name':
       await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'family_intro') }]});
       return;
-    }
-    // SELF → ask conditions
-    await setOnboardingState(patientId, 'asking_conditions');
-    await client.replyMessage({ replyToken, messages: [buildQuickReply(S(l, 'ask_conditions'), S(l, 'condition_buttons'))]});
-    return;
-  }
 
-  // ── guardian_asking_patient_name ───────────────────────────
-  if (state === 'guardian_asking_patient_name') {
-    if (!text || text.length < 1) {
-      await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'name_retry') }]});
+    case 'conditions': {
+      const askKey = profile.care_mode === 'family' ? 'ask_conditions_for' : 'ask_conditions';
+      const askArg = profile.care_mode === 'family' ? (profile.patient_name || '') : undefined;
+      await client.replyMessage({ replyToken, messages: [buildQuickReply(
+        askArg !== undefined ? S(l, askKey, askArg) : S(l, askKey),
+        S(l, 'condition_buttons')
+      )]});
       return;
     }
-    await pool.query(`UPDATE patients SET display_name=$1 WHERE id=$2`, [text, patientId]);
-    await setOnboardingState(patientId, 'guardian_asking_patient_conditions');
-    await client.replyMessage({ replyToken, messages: [buildQuickReply(S(l, 'ask_conditions_for', text), S(l, 'condition_buttons'))]});
-    return;
-  }
 
-  // ── guardian_asking_patient_conditions ─────────────────────
-  if (state === 'guardian_asking_patient_conditions') {
-    const condIntent = await classifyIntent(text, 'has_conditions');
-    const conditions = condIntent === 'NO_CONDITIONS' ? null : text;
-    await pool.query(`UPDATE patients SET conditions=$1 WHERE id=$2`, [conditions, patientId]);
-    await setOnboardingState(patientId, 'guardian_asking_meal_times');
-    const patientNameResult = await pool.query(`SELECT display_name FROM patients WHERE id=$1`, [patientId]);
-    const patientName = patientNameResult.rows[0]?.display_name;
-    await client.replyMessage({ replyToken, messages: [{ type: 'text',
-      text: S(l, 'ask_meal_times_for', patientName) }]});
-    return;
-  }
+    case 'meal_times': {
+      const key = profile.care_mode === 'family' ? 'ask_meal_times_for' : 'ask_meal_times';
+      const arg = profile.care_mode === 'family' ? (profile.patient_name || '') : (profile.self_name || '');
+      await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, key, arg) }]});
+      return;
+    }
 
-  // ── guardian_asking_meal_times ─────────────────────────────
-  if (state === 'guardian_asking_meal_times') {
-    const looksEmpty = text.trim().length < 3;
-    if (looksEmpty) {
-      await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'meal_times_retry') }]});
+    case 'med_time':
+      // We have a pending med but somehow returned here without asking; ask now.
+      await client.replyMessage({ replyToken, messages: [buildQuickReply(
+        S(l, 'ask_med_time', profile.pending_med.name, profile.pending_med.dosage),
+        l === 'en' ? TIME_BUTTONS_EN : TIME_BUTTONS
+      )]});
       return;
-    }
-    const times = await parseMealTimes(text);
-    await pool.query(
-      `UPDATE patients SET meal_morning=$1, meal_midday=$2, meal_evening=$3, meal_bedtime=$4 WHERE id=$5`,
-      [times.morning, times.midday, times.evening, times.bedtime, patientId]
-    );
-    await setOnboardingState(patientId, 'guardian_asking_patient_meds');
-    await client.replyMessage({ replyToken, messages: [
-      { type: 'text', text: S(l, 'meal_times_saved', times.morning, times.midday, times.evening, times.bedtime) },
-      buildQuickReply(S(l, 'ask_meds_for'), S(l, 'med_buttons')),
-    ]});
-    return;
-  }
 
-  // ── guardian_asking_patient_meds ───────────────────────────
-  if (state === 'guardian_asking_patient_meds') {
-    const { name: gDirectName } = parseMedication(text);
-    const gDoneWords = ['หมด','พอ','เท่านี้','ถูก','โอเค','ok','ใช่','ครบ','เสร็จ','ไม่มี','no','none','done'];
-    const gStartsWithDone = gDoneWords.some(w => text.toLowerCase().startsWith(w) || text.toLowerCase() === w);
-    if (gDirectName && gDirectName.length >= 2 && !gStartsWithDone && text.length < 60) {
-      await handleGuardianMedEntry(replyToken, patientId, text, patient);
-      return;
-    }
-    const medIntent = await classifyIntent(text, 'has_meds');
-    if (medIntent === 'NO_MEDS') {
-      await setOnboardingState(patientId, 'guardian_confirming');
-      await guardianShowConfirmation(replyToken, patientId, l);
-      return;
-    }
-    if (medIntent === 'PHOTO') {
-      await setOnboardingState(patientId, 'guardian_asking_more_meds');
-      await client.replyMessage({ replyToken, messages: [{ type: 'text', text: l === 'en' ? 'Send a photo of the medicine label 📷' : 'ถ่ายรูปฉลากยามาได้เลยครับ 📷' }]});
-      return;
-    }
-    if (medIntent === 'HAS_MEDS') {
-      await setOnboardingState(patientId, 'guardian_asking_more_meds');
-      await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'ask_med_name') }]});
-      return;
-    }
-    await handleGuardianMedEntry(replyToken, patientId, text, patient);
-    return;
-  }
-
-  // ── guardian_asking_med_time ───────────────────────────────
-  if (state === 'guardian_asking_med_time') {
-    const pendingResult = await pool.query(`SELECT pending_med_name, pending_med_dosage FROM patients WHERE id=$1`, [patientId]);
-    const { pending_med_name, pending_med_dosage } = pendingResult.rows[0];
-    const { schedule } = parseMedication(text);
-    const finalSchedule = schedule.length > 0 ? schedule : ['08:00'];
-    const med = await saveMedicationToDB(patientId, pending_med_name, pending_med_dosage, finalSchedule);
-    await pool.query(`UPDATE patients SET pending_med_name=$1, pending_med_dosage=NULL, onboarding_state='guardian_asking_pill_count' WHERE id=$2`, [med.name, patientId]);
-    await client.replyMessage({ replyToken, messages: [buildQuickReply(
-      S(l, 'med_saved', formatMed(med)) + S(l, 'ask_pill_count', med.name),
-      S(l, 'pill_buttons')
-    )]});
-    return;
-  }
-
-  // ── guardian_asking_pill_count ─────────────────────────────
-  if (state === 'guardian_asking_pill_count') {
-    const pendingResult = await pool.query(`SELECT pending_med_name FROM patients WHERE id=$1`, [patientId]);
-    const medName = pendingResult.rows[0]?.pending_med_name;
-    const numMatch = text.match(/\d+/);
-    const pills = numMatch ? parseInt(numMatch[0]) : null;
-    const unknown = /ไม่ทราบ|ไม่รู้|not sure|unknown/i.test(text);
-    if (pills && !unknown) {
-      const doseResult = await pool.query(
-        `SELECT array_length(schedule,1) as doses_per_day FROM medications WHERE patient_id=$1 AND name=$2 AND active=TRUE ORDER BY created_at DESC LIMIT 1`,
-        [patientId, medName]
-      );
-      const dosesPerDay = doseResult.rows[0]?.doses_per_day || 1;
-      await pool.query(`UPDATE medications SET pills_remaining=$1, refill_alert_at=$2 WHERE patient_id=$3 AND name=$4 AND active=TRUE`,
-        [pills, Math.max(7, dosesPerDay * 7), patientId, medName]);
-    }
-    await pool.query(`UPDATE patients SET pending_med_name=NULL, onboarding_state='guardian_asking_more_meds' WHERE id=$1`, [patientId]);
-    await client.replyMessage({ replyToken, messages: [buildQuickReply(
-      pills && !unknown ? S(l, 'pill_saved', pills) : S(l, 'pill_skip'),
-      S(l, 'more_med_buttons')
-    )]});
-    return;
-  }
-
-  // ── guardian_asking_more_meds ──────────────────────────────
-  if (state === 'guardian_asking_more_meds') {
-    const { name: parsedName } = parseMedication(text);
-    const doneWords = ['หมด','พอ','เท่านี้','ถูก','โอเค','ok','ใช่','ครบ','เสร็จ','all done','done','finish'];
-    const startsWithDone = doneWords.some(w => text.toLowerCase().startsWith(w) || text.toLowerCase() === w);
-    if (parsedName && parsedName.length >= 2 && !startsWithDone && text.length < 60) {
-      await handleGuardianMedEntry(replyToken, patientId, text, patient);
-      return;
-    }
-    const doneIntent = await classifyIntent(text, 'done_or_more');
-    if (doneIntent === 'DONE') {
-      await setOnboardingState(patientId, 'guardian_confirming');
-      await guardianShowConfirmation(replyToken, patientId, l);
-      return;
-    }
-    if (doneIntent === 'MORE') {
-      await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'next_med') }]});
-      return;
-    }
-    await handleGuardianMedEntry(replyToken, patientId, text, patient);
-    return;
-  }
-
-  // ── guardian_confirming ────────────────────────────────────
-  if (state === 'guardian_confirming') {
-    const confirmIntent = await classifyIntent(text, 'correct_or_edit');
-    if (confirmIntent === 'CORRECT') {
-      await setOnboardingState(patientId, 'complete');
-      const patientData = await pool.query(`SELECT display_name FROM patients WHERE id=$1`, [patientId]);
-      const patientName = patientData.rows[0]?.display_name;
-      try {
-        const { deepLink } = await createInviteLink(lineUserId, patientName);
-        const card = buildInviteCard(deepLink, patientName);
-        await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'guardian_complete', patientName) }, card]});
-      } catch (err) {
-        await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'guardian_complete_fallback', patientName) }]});
+    case 'medications': {
+      // First time we arrive here (meal times just saved) → invite them to list meds.
+      const askKey = profile.care_mode === 'family' ? 'ask_meds_for' : 'ask_meds';
+      const msgs = [];
+      if (profile.meal_times && profile._showMealSaved) {
+        const t = profile.meal_times;
+        msgs.push({ type: 'text', text: S(l, 'meal_times_saved', t.morning, t.midday, t.evening, t.bedtime) });
+        profile._showMealSaved = false;
       }
+      msgs.push(buildQuickReply(S(l, askKey), S(l, 'med_buttons')));
+      await client.replyMessage({ replyToken, messages: msgs });
       return;
     }
-    if (confirmIntent === 'EDIT') {
-      await setOnboardingState(patientId, 'guardian_asking_more_meds');
-      await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'edit_meds') }]});
-      return;
-    }
-    await guardianShowConfirmation(replyToken, patientId, l);
-    return;
-  }
-  if (state === 'asking_conditions') {
-    const intent = await classifyIntent(text, 'has_conditions');
-    const conditions = intent === 'NO_CONDITIONS' ? null : text;
-    await pool.query(`UPDATE patients SET conditions = $1 WHERE id = $2`, [conditions, patientId]);
-    await setOnboardingState(patientId, 'asking_meal_times');
-    await client.replyMessage({ replyToken, messages: [{ type: 'text',
-      text: S(l, 'ask_meal_times', patient.display_name) }]});
-    return;
-  }
 
-  // ── asking_meal_times: parse personal schedule, then ask meds ─
-  if (state === 'asking_meal_times') {
-    const times = await parseMealTimes(text);
-    // Need at least one recognisable time — if all are defaults and text looks like gibberish, retry
-    const looksEmpty = text.trim().length < 3;
-    if (looksEmpty) {
-      await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'meal_times_retry') }]});
-      return;
-    }
-    await pool.query(
-      `UPDATE patients SET meal_morning=$1, meal_midday=$2, meal_evening=$3, meal_bedtime=$4 WHERE id=$5`,
-      [times.morning, times.midday, times.evening, times.bedtime, patientId]
-    );
-    await setOnboardingState(patientId, 'asking_meds');
-    await client.replyMessage({ replyToken, messages: [
-      { type: 'text', text: S(l, 'meal_times_saved', times.morning, times.midday, times.evening, times.bedtime) },
-      buildQuickReply(S(l, 'ask_meds'), S(l, 'med_buttons')),
-    ]});
-    return;
-  }
-
-  // ── asking_meds ───────────────────────────────────────────
-  if (state === 'asking_meds') {
-    const { name: soloDirectName } = parseMedication(text);
-    const soloDoneWords = ['หมด','พอ','เท่านี้','ถูก','โอเค','ok','ใช่','ครบ','เสร็จ','ไม่มี','no','none','done'];
-    const soloStartsWithDone = soloDoneWords.some(w => text.toLowerCase().startsWith(w) || text.toLowerCase() === w);
-    if (soloDirectName && soloDirectName.length >= 2 && !soloStartsWithDone && text.length < 60) {
-      await handleMedEntry(replyToken, patientId, text, patient);
-      return;
-    }
-    const intent = await classifyIntent(text, 'has_meds');
-    if (intent === 'NO_MEDS') {
-      await setOnboardingState(patientId, 'complete');
-      await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'complete_no_meds', patient.display_name) }]});
-      return;
-    }
-    if (intent === 'PHOTO') {
-      await setOnboardingState(patientId, 'asking_more_meds');
-      await client.replyMessage({ replyToken, messages: [{ type: 'text', text: l === 'en' ? 'Send a photo of the medicine label 📷' : 'ถ่ายรูปฉลากยามาได้เลยครับ ลุงจะอ่านและจดไว้ให้ครับ 📷' }]});
-      return;
-    }
-    if (intent === 'HAS_MEDS') {
-      await setOnboardingState(patientId, 'asking_more_meds');
-      await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'ask_med_name') }]});
-      return;
-    }
-    const { name: directName } = parseMedication(text);
-    if (directName && directName.length >= 2) {
-      await handleMedEntry(replyToken, patientId, text, patient);
-      return;
-    }
-    await client.replyMessage({ replyToken, messages: [buildQuickReply(S(l, 'ask_meds'), S(l, 'med_buttons'))]});
-    return;
-  }
-
-  // ── asking_med_time ───────────────────────────────────────
-  if (state === 'asking_med_time') {
-    const pendingResult = await pool.query(`SELECT pending_med_name, pending_med_dosage FROM patients WHERE id = $1`, [patientId]);
-    const { pending_med_name, pending_med_dosage } = pendingResult.rows[0];
-    const { schedule } = parseMedication(text);
-    const finalSchedule = schedule.length > 0 ? schedule : ['08:00'];
-    const med = await saveMedicationToDB(patientId, pending_med_name, pending_med_dosage, finalSchedule);
-    await pool.query(`UPDATE patients SET pending_med_name=$1, pending_med_dosage=NULL, onboarding_state='asking_pill_count' WHERE id=$2`, [med.name, patientId]);
-    await client.replyMessage({ replyToken, messages: [buildQuickReply(
-      S(l, 'med_saved', formatMed(med)) + S(l, 'ask_pill_count', med.name),
-      S(l, 'pill_buttons')
-    )]});
-    return;
-  }
-
-  // ── asking_pill_count ─────────────────────────────────────
-  if (state === 'asking_pill_count') {
-    const pendingResult = await pool.query(`SELECT pending_med_name FROM patients WHERE id=$1`, [patientId]);
-    const medName = pendingResult.rows[0]?.pending_med_name;
-    const numMatch = text.match(/\d+/);
-    const pills = numMatch ? parseInt(numMatch[0]) : null;
-    const unknown = /ไม่ทราบ|ไม่รู้|not sure|unknown|พิมพ์จำนวน|type number/i.test(text);
-    if (pills && !unknown) {
-      const doseResult = await pool.query(
-        `SELECT array_length(schedule,1) as doses_per_day FROM medications WHERE patient_id=$1 AND name=$2 AND active=TRUE ORDER BY created_at DESC LIMIT 1`,
-        [patientId, medName]
-      );
-      const dosesPerDay = doseResult.rows[0]?.doses_per_day || 1;
-      await pool.query(`UPDATE medications SET pills_remaining=$1, refill_alert_at=$2 WHERE patient_id=$3 AND name=$4 AND active=TRUE`,
-        [pills, Math.max(7, dosesPerDay * 7), patientId, medName]);
-    }
-    await pool.query(`UPDATE patients SET pending_med_name=NULL, onboarding_state='asking_more_meds' WHERE id=$1`, [patientId]);
-    await client.replyMessage({ replyToken, messages: [buildQuickReply(
-      pills && !unknown ? S(l, 'pill_saved', pills) : S(l, 'pill_skip'),
-      S(l, 'more_med_buttons')
-    )]});
-    return;
-  }
-
-  if (state === 'asking_more_meds') {
-    const { name: parsedName } = parseMedication(text);
-    const doneWords = ['หมด','พอ','เท่านี้','เท่า','ถูก','โอเค','ok','ใช่','ครบ','เสร็จ','all done','done','finish'];
-    const moreWords = ['มียาอีก','มีอีก','เพิ่ม','add another','more'];
-    const startsWithDoneOrMore = [...doneWords, ...moreWords].some(w => text.toLowerCase().startsWith(w) || text.toLowerCase() === w);
-    if (parsedName && parsedName.length >= 2 && !startsWithDoneOrMore && text.length < 60) {
-      await handleMedEntry(replyToken, patientId, text, patient);
-      return;
-    }
-    const intent = await classifyIntent(text, 'done_or_more');
-    if (intent === 'DONE') {
-      await setOnboardingState(patientId, 'confirming_meds');
-      const card = await buildMedCard(patientId, l === 'en' ? '💊 Your medications' : '💊 รายการยาที่ลุงจดไว้');
+    case 'confirm': {
+      // Show the full medication list once and ask for confirmation.
+      const header = profile.care_mode === 'family'
+        ? (l === 'en' ? `💊 ${profile.patient_name || 'Parent'}'s medications` : `💊 ยาของคุณ${profile.patient_name || 'ท่าน'}`)
+        : (l === 'en' ? '💊 Your medications' : '💊 รายการยาที่ลุงจดไว้');
+      const card = await buildMedCard(patientId, header);
+      const nameForConfirm = profile.care_mode === 'family' ? (profile.patient_name || '') : (profile.self_name || '');
       await client.replyMessage({ replyToken, messages: [
         card,
-        buildQuickReply(S(l, 'ask_confirm', patient.display_name), S(l, 'confirm_buttons')),
+        buildQuickReply(S(l, 'ask_confirm', nameForConfirm), S(l, 'confirm_buttons')),
       ]});
       return;
     }
-    if (intent === 'MORE') {
-      await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'next_med') }]});
-      return;
-    }
-    await handleMedEntry(replyToken, patientId, text, patient);
-    return;
-  }
 
-  // ── confirming_meds ───────────────────────────────────────
-  if (state === 'confirming_meds') {
-    const intent = await classifyIntent(text, 'correct_or_edit');
-    if (intent === 'CORRECT') {
-      await setOnboardingState(patientId, 'complete');
-      const countResult = await pool.query(`SELECT COUNT(*) FROM medications WHERE patient_id = $1 AND active = TRUE`, [patientId]);
-      const count = parseInt(countResult.rows[0].count);
-      await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'complete_solo', patient.display_name, count) }]});
+    case 'complete':
+      await finishOnboarding(replyToken, patient, profile);
       return;
-    }
-    if (intent === 'EDIT') {
-      await setOnboardingState(patientId, 'asking_more_meds');
-      await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'edit_meds') }]});
-      return;
-    }
-    await client.replyMessage({ replyToken, messages: [buildQuickReply(S(l, 'confirm_unclear'), S(l, 'confirm_buttons'))]});
-    return;
   }
 }
 
-async function guardianShowConfirmation(replyToken, patientId, l = 'th') {
-  const patientData = await pool.query(`SELECT display_name, conditions FROM patients WHERE id=$1`, [patientId]);
-  const p = patientData.rows[0];
-  const card = await buildMedCard(patientId, l === 'en' ? `💊 ${p.display_name || 'Parent'}'s medications` : `💊 ยาของคุณ${p.display_name || 'ท่าน'}`);
-  const condLabel = l === 'en' ? 'Conditions' : 'โรคประจำตัว';
-  const noneLabel = l === 'en' ? 'None' : 'ไม่มี';
-  await client.replyMessage({ replyToken, messages: [
-    { type: 'text', text: `${l === 'en' ? `${p.display_name || 'Parent'}'s info` : `ข้อมูลคุณ${p.display_name || 'ท่าน'}`}:\n• ${condLabel}: ${p.conditions || noneLabel}` },
-    card,
-    buildQuickReply(S(l, 'ask_confirm', ''), S(l, 'confirm_buttons')),
-  ]});
-}
+// ------------------------------------------------------------
+// finishOnboarding: mark complete and send the right closing message.
+// Self mode → friendly wrap-up. Family mode → create + send invite link.
+// ------------------------------------------------------------
+async function finishOnboarding(replyToken, patient, profile) {
+  const patientId = patient.id;
+  const lineUserId = patient.line_user_id || profile._lineUserId;
+  const l = profile.language || 'th';
+  await setOnboardingState(patientId, 'complete');
+  clearProfile(patientId);
+  medCache.delete(patientId);
 
-// Guardian med entry — same as patient but stays in guardian states
-async function handleGuardianMedEntry(replyToken, patientId, text, patient) {
-  const l = lang(patient);
+  if (profile.care_mode === 'family') {
+    const patientName = profile.patient_name || '';
+    try {
+      const { deepLink } = await createInviteLink(lineUserId, patientName);
+      const card = buildInviteCard(deepLink, patientName);
+      await client.replyMessage({ replyToken, messages: [
+        { type: 'text', text: S(l, 'guardian_complete', patientName) },
+        card,
+      ]});
+    } catch (err) {
+      console.error('Invite link creation failed at onboarding finish:', err.message);
+      await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'guardian_complete_fallback', patientName) }]});
+    }
+    return;
+  }
 
-  const { name, dosage, schedule } = parseMedication(text);
-  if (!name || name.length < 2) {
-    await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'med_name_unclear') }]});
-    return;
-  }
-  if (!hasTimeInfo(text)) {
-    await pool.query(`UPDATE patients SET pending_med_name=$1, pending_med_dosage=$2, onboarding_state='guardian_asking_med_time' WHERE id=$3`, [name, dosage, patientId]);
-    await client.replyMessage({ replyToken, messages: [buildQuickReply(S(l, 'ask_med_time', name, dosage), l === 'en' ? TIME_BUTTONS_EN : TIME_BUTTONS)]});
-    return;
-  }
-  const med = await saveMedicationToDB(patientId, name, dosage, schedule);
-  await pool.query(`UPDATE patients SET pending_med_name=$1, onboarding_state='guardian_asking_pill_count' WHERE id=$2`, [med.name, patientId]);
-  await client.replyMessage({ replyToken, messages: [buildQuickReply(
-    S(l, 'med_saved', formatMed(med)) + S(l, 'ask_pill_count', med.name),
-    S(l, 'pill_buttons')
-  )]});
-}
-
-// Helper: handle med entry + ask for time if missing
-async function handleMedEntry(replyToken, patientId, text, patient) {
-  const l = lang(patient);
-  const { name, dosage, schedule } = parseMedication(text);
-  if (!name || name.length < 2) {
-    await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'med_name_unclear') }]});
-    return;
-  }
-  if (!hasTimeInfo(text)) {
-    await pool.query(`UPDATE patients SET pending_med_name = $1, pending_med_dosage = $2 WHERE id = $3`, [name, dosage, patientId]);
-    await pool.query(`UPDATE patients SET onboarding_state = 'asking_med_time' WHERE id = $1`, [patientId]);
-    await client.replyMessage({ replyToken, messages: [buildQuickReply(S(l, 'ask_med_time', name, dosage), l === 'en' ? TIME_BUTTONS_EN : TIME_BUTTONS)]});
-    return;
-  }
-  const med = await saveMedicationToDB(patientId, name, dosage, schedule);
-  await pool.query(`UPDATE patients SET pending_med_name=$1, onboarding_state='asking_pill_count' WHERE id=$2`, [med.name, patientId]);
-  await client.replyMessage({ replyToken, messages: [buildQuickReply(
-    S(l, 'med_saved', formatMed(med)) + S(l, 'ask_pill_count', med.name),
-    S(l, 'pill_buttons')
-  )]});
+  // Self mode
+  const countResult = await pool.query(`SELECT COUNT(*) FROM medications WHERE patient_id=$1 AND active=TRUE`, [patientId]);
+  const count = parseInt(countResult.rows[0].count);
+  const msgKey = count > 0 ? 'complete_solo' : 'complete_no_meds';
+  const msg = count > 0
+    ? S(l, 'complete_solo', profile.self_name || '', count)
+    : S(l, 'complete_no_meds', profile.self_name || '');
+  await client.replyMessage({ replyToken, messages: [{ type: 'text', text: msg }]});
 }
 
 // ============================================================
 // IMAGE DURING ONBOARDING (photo of medicine label)
+// Reads the label, then funnels the parsed med into the same slot flow.
 // ============================================================
 
 async function handleImageDuringOnboarding(event, patient) {
-  const l = lang(patient);
+  const profile = await getProfile(patient);
+  const l = profile.language || lang(patient);
+  const patientId = patient.id;
+
+  // If we're not yet at the medication-collection phase, a photo isn't
+  // expected here — gently steer back to whatever we still need.
+  const step = nextStep(profile);
+  if (step !== 'medications' && step !== 'med_time' && step !== 'confirm') {
+    await advanceOnboarding(event.replyToken, patient, profile);
+    return;
+  }
+
   try {
     const stream = await blobClient.getMessageContent(event.message.id);
     const chunks = [];
@@ -1105,14 +1190,18 @@ async function handleImageDuringOnboarding(event, patient) {
       await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: S(l, 'photo_ask_retake') }]});
       return;
     }
-    await pool.query(`UPDATE patients SET pending_med_name = $1, pending_med_dosage = $2, onboarding_state = 'asking_med_time' WHERE id = $3`, [name, dosage, patient.id]);
+    // Stash as a pending med awaiting its time, then ask the time.
+    profile.pending_med = { name, dosage: dosage || null };
+    profile.meds_done = false;
+    profile.confirmed = null;
+    await pool.query(`UPDATE patients SET pending_med_name=$1, pending_med_dosage=$2 WHERE id=$3`, [name, dosage || null, patientId]);
     await client.replyMessage({ replyToken: event.replyToken, messages: [buildQuickReply(
       S(l, 'photo_read', name, dosage),
       l === 'en' ? TIME_BUTTONS_EN : TIME_BUTTONS
     )]});
   } catch (err) {
     console.error('Image onboarding error:', err.message);
-    await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: S(lang(patient), 'photo_ask_retake') }]});
+    await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: S(profile.language || lang(patient), 'photo_ask_retake') }]});
   }
 }
 
@@ -2156,7 +2245,8 @@ async function handleEvent(event) {
 
   // Onboarding routing
   if (needsOnboarding(patient)) {
-    if (event.message.type === 'image' && (patient.onboarding_state === 'asking_more_meds' || patient.onboarding_state === 'guardian_asking_more_meds')) {
+    if (event.message.type === 'image') {
+      // A photo during onboarding is almost always a medicine label.
       await handleImageDuringOnboarding(event, patient);
     } else if (event.message.type === 'text') {
       await handleOnboarding(event, patient);
