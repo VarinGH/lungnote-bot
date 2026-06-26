@@ -60,7 +60,7 @@ const TIME_LABELS = {
 };
 
 // ============================================================
-// INTENT CLASSIFIER — uses Haiku to understand natural language
+// INTENT CLASSIFIER — uses Haiku for onboarding state machine
 // ============================================================
 
 async function classifyIntent(text, context) {
@@ -87,6 +87,66 @@ async function classifyIntent(text, context) {
   } catch (err) {
     console.error('Intent classification failed:', err.message);
     return 'UNCLEAR';
+  }
+}
+
+// ============================================================
+// MASTER INTENT ROUTER — runs on every post-onboarding message
+// Single Haiku call replaces all keyword matching in handleTextMessage.
+// Returns { intent, entities } where intent is one of:
+//   med_taken | med_snooze | log_reading | add_med | update_med |
+//   book_appointment | check_patient | check_med_list | check_history |
+//   send_invite | other
+// ============================================================
+
+async function routeIntent(text, isGuardianUser) {
+  const prompt = `You are a routing classifier for a Thai health assistant LINE bot called "ลุงโน้ต".
+The user is ${isGuardianUser ? 'a GUARDIAN (adult child managing elderly parent)' : 'a PATIENT (elderly person)'}.
+
+User message: "${text}"
+
+Classify the intent and extract entities. Reply ONLY with valid JSON, no other text:
+
+{
+  "intent": "<one of the intents below>",
+  "entities": {}
+}
+
+INTENTS and when to use them:
+- "med_taken": User confirming they took medication. Examples: "กินแล้ว", "ทานยาแล้ว", "เพิ่งกินมา", "กินเรียบร้อย", "ok กินแล้ว", "👍", "✅", "done"
+- "med_snooze": User acknowledging reminder but not yet taken. Examples: "เดี๋ยวกิน", "อีกครู่", "รอก่อน", "กำลังจะกิน"
+- "log_reading": User reporting a health measurement. Extract: type (bp/glucose/spo2/temp/weight), values. Examples: "130/85", "น้ำตาล 7.2", "วัดความดันได้ 120/80", "อุณหภูมิ 37.5", "น้ำหนัก 65 กิโล"
+- "add_med": User wants to add a new medication to their list. Examples: "เพิ่มยา", "มียาตัวใหม่", "ลืมบอกยา"
+- "update_med": User wants to change existing medication schedule or dose. Examples: "เปลี่ยนเวลายา", "ลดโดส", "หยุดยา", "แก้ยา"
+- "book_appointment": User wants to record a doctor/hospital appointment. Examples: "นัดหมอ", "นัดตรวจ", "วันศุกร์ต้องไปโรงพยาบาล", "จำนัด"
+- "check_patient": GUARDIAN ONLY — wants to see patient health status/dashboard. Examples: "แม่เป็นยังไง", "ดูข้อมูลพ่อ", "รายงานวันนี้", "สุขภาพเป็นยังไง"
+- "check_med_list": User wants to see their medication list. Examples: "รายการยา", "มียาอะไรบ้าง", "ดูยา", "ยาทั้งหมด"
+- "check_history": User wants to see past health data. Examples: "ความดันเดือนนี้", "ประวัติน้ำตาล", "ค่าล่าสุด"
+- "send_invite": GUARDIAN ONLY — wants to send invite link to patient. Examples: "เชิญ", "ส่งลิงก์", "เพิ่มพ่อ", "invite"
+- "other": Anything else — general chat, questions, unclear messages
+
+For "log_reading", extract entities like:
+{"type":"bp","value_1":130,"value_2":85,"unit":"mmHg"}
+{"type":"glucose","value_1":7.2,"unit":"mmol"}
+{"type":"weight","value_1":65,"unit":"kg"}
+
+For other intents, entities can be {} or relevant extracted info.`;
+
+  try {
+    const response = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 150,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const raw = response.content.find(b => b.type === 'text')?.text?.trim() || '{}';
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return { intent: 'other', entities: {} };
+    const parsed = JSON.parse(jsonMatch[0]);
+    console.log(`🧭 Intent: ${parsed.intent} | "${text.slice(0,40)}"`);
+    return { intent: parsed.intent || 'other', entities: parsed.entities || {} };
+  } catch (err) {
+    console.error('Master intent router failed:', err.message);
+    return { intent: 'other', entities: {} };
   }
 }
 
@@ -1670,11 +1730,8 @@ async function buildDashboardCard(guardianLineUserId) {
   };
 }
 
-// Detect caregiver dashboard request
-const DASHBOARD_TRIGGERS = [
-  'เป็นยังไง', 'สุขภาพ', 'ดูแล', 'รายงาน', 'dashboard',
-  'วันนี้เป็น', 'อาการ', 'ค่าวันนี้', 'สรุป', 'ข้อมูลวันนี้',
-];
+// ============================================================
+// CAREGIVER DASHBOARD — Flex Message card
 
 async function isGuardian(lineUserId) {
   const result = await pool.query(
@@ -1686,11 +1743,6 @@ async function isGuardian(lineUserId) {
 // ============================================================
 // GUARDIAN INVITE LINK SYSTEM
 // ============================================================
-
-const INVITE_TRIGGERS = [
-  'เชิญ', 'ส่งลิงก์', 'ลิงก์เชิญ', 'เพิ่มพ่อ', 'เพิ่มแม่',
-  'เพิ่มผู้ป่วย', 'เพิ่มสมาชิก', 'invite', 'link',
-];
 
 // Generate a cryptographically random token
 function generateToken() {
@@ -1931,12 +1983,7 @@ async function handleAppointmentSlipPhoto(imageBase64, patientId, replyToken) {
 // TEXT MESSAGE HANDLER
 // ============================================================
 
-function isTakenConfirmation(text) {
-  return ['กินแล้ว','ทานแล้ว','กินยาแล้ว','ทานยาแล้ว','โอเค','ok','✅','👍','เรียบร้อย','done'].some(w => text.toLowerCase().includes(w));
-}
-
-const MED_LIST_TRIGGERS = ['รายการยา','ยาอะไรบ้าง','จดยาอะไร','มียาอะไร','ยาทั้งหมด','ดูยา','ยาของฉัน'];
-
+// APPT_TRIGGERS kept for image context detection in handleImageMessage
 const APPT_TRIGGERS = ['นัดหมอ','นัดแพทย์','นัด รพ','นัดโรงพยาบาล','นัดคลินิก','จำนัด','บันทึกนัด'];
 
 // Parse appointment date/time from Thai natural language
@@ -1979,15 +2026,11 @@ async function handleTextMessage(event, patientId) {
   const userMessage = event.message.text;
   const lineUserId = event.source.userId;
 
-  // ── Admin reset command (dev only — protected by secret) ──
-  // Type: RESET_LUNGNOTE_DEV to wipe your own account
+  // ── Dev reset (always check first, no LLM cost) ───────────
   if (userMessage === 'RESET_LUNGNOTE_DEV') {
     try {
-      const hResult = await pool.query(
-        `SELECT household_id FROM patients WHERE id=$1`, [patientId]
-      );
+      const hResult = await pool.query(`SELECT household_id FROM patients WHERE id=$1`, [patientId]);
       const hid = hResult.rows[0]?.household_id;
-
       await pool.query(`DELETE FROM medications WHERE patient_id=$1`, [patientId]);
       await pool.query(`DELETE FROM conversation_history WHERE patient_id=$1`, [patientId]);
       await pool.query(`DELETE FROM medication_logs WHERE patient_id=$1`, [patientId]);
@@ -1998,11 +2041,9 @@ async function handleTextMessage(event, patientId) {
       if (hid) await pool.query(`DELETE FROM guardians WHERE household_id=$1`, [hid]);
       await pool.query(
         `UPDATE patients SET onboarding_state='new', display_name=NULL, conditions=NULL,
-         pending_med_name=NULL, pending_med_dosage=NULL WHERE id=$1`,
-        [patientId]
+         pending_med_name=NULL, pending_med_dosage=NULL WHERE id=$1`, [patientId]
       );
       medCache.delete(patientId);
-
       await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text',
         text: '🔄 รีเซ็ตบัญชีเรียบร้อยแล้วครับ ส่งข้อความใดก็ได้เพื่อเริ่ม onboarding ใหม่ครับ' }]});
     } catch (err) {
@@ -2012,40 +2053,31 @@ async function handleTextMessage(event, patientId) {
     return;
   }
 
-  // ── Invite token from patient clicking guardian link ──────
-  // Token messages arrive as "INVITE_XXXXXXXX"
+  // ── Invite token (always check before LLM — exact prefix match) ──
   if (userMessage.startsWith('INVITE_')) {
     const token = userMessage.replace('INVITE_', '').trim();
     const result = await handleInviteToken(lineUserId, token);
-
-    if (result.success) {
-      await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text',
-        text: `ยินดีต้อนรับครับ คุณ${result.patientName || ''}! 🎉\nลุงโน้ตพร้อมดูแลคุณแล้วนะครับ\nลูกหลานของคุณจะได้รับรายงานสุขภาพจากลุงด้วยนะครับ 😊\n\nบอกค่าความดัน น้ำตาล หรืออาการมาได้เลยครับ` }]});
-    } else if (result.reason === 'used') {
-      await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text',
-        text: 'ขอโทษครับ ลิงก์นี้ถูกใช้ไปแล้ว ขอให้ลูกหลานสร้างลิงก์ใหม่ให้นะครับ' }]});
-    } else if (result.reason === 'expired') {
-      await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text',
-        text: 'ขอโทษครับ ลิงก์หมดอายุแล้ว (ใช้ได้แค่ 24 ชั่วโมง) ขอให้ลูกหลานสร้างลิงก์ใหม่ให้นะครับ' }]});
-    } else if (result.reason === 'already_linked') {
-      await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text',
-        text: 'คุณเชื่อมต่อกับลุงโน้ตอยู่แล้วนะครับ 😊 พิมพ์มาคุยกับลุงได้เลยครับ' }]});
-    } else {
-      await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text',
-        text: 'ขอโทษครับ ลิงก์ไม่ถูกต้อง ขอให้ลูกหลานส่งลิงก์ใหม่ให้นะครับ' }]});
-    }
+    const msgs = {
+      true:           `ยินดีต้อนรับครับ คุณ${result.patientName || ''}! 🎉\nลุงโน้ตพร้อมดูแลคุณแล้วนะครับ\nลูกหลานของคุณจะได้รับรายงานสุขภาพจากลุงด้วยนะครับ 😊\n\nบอกค่าความดัน น้ำตาล หรืออาการมาได้เลยครับ`,
+      used:           'ขอโทษครับ ลิงก์นี้ถูกใช้ไปแล้ว ขอให้ลูกหลานสร้างลิงก์ใหม่ให้นะครับ',
+      expired:        'ขอโทษครับ ลิงก์หมดอายุแล้ว (ใช้ได้แค่ 24 ชั่วโมง) ขอให้ลูกหลานสร้างลิงก์ใหม่ให้นะครับ',
+      already_linked: 'คุณเชื่อมต่อกับลุงโน้ตอยู่แล้วนะครับ 😊 พิมพ์มาคุยกับลุงได้เลยครับ',
+    };
+    const msg = result.success ? msgs['true'] : (msgs[result.reason] || 'ขอโทษครับ ลิงก์ไม่ถูกต้อง ขอให้ลูกหลานส่งลิงก์ใหม่ให้นะครับ');
+    await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: msg }]});
     return;
   }
 
-  // ── Guardian invite link generation ───────────────────────
-  if (await isGuardian(lineUserId) && INVITE_TRIGGERS.some(t => userMessage.includes(t))) {
-    // Extract patient name from message if provided
-    // e.g. "เชิญคุณพ่อสมชาย" → "สมชาย"
+  // ── Master intent router — one Haiku call routes everything ──
+  const guardianUser = await isGuardian(lineUserId);
+  const { intent, entities } = await routeIntent(userMessage, guardianUser);
+
+  // ── send_invite ────────────────────────────────────────────
+  if (intent === 'send_invite' && guardianUser) {
     const nameMatch = userMessage.match(/(?:เชิญ|เพิ่ม)(?:คุณพ่อ|คุณแม่|พ่อ|แม่|ผู้ป่วย|สมาชิก)?\s*(.{1,20})?/);
     const patientName = nameMatch?.[1]?.trim() || null;
-
     try {
-      const { deepLink, token } = await createInviteLink(lineUserId, patientName);
+      const { deepLink } = await createInviteLink(lineUserId, patientName);
       const card = buildInviteCard(deepLink, patientName);
       await client.replyMessage({ replyToken: event.replyToken, messages: [
         card,
@@ -2059,26 +2091,26 @@ async function handleTextMessage(event, patientId) {
     return;
   }
 
-  // Guardian dashboard request → serve Flex card from DB (฿0 LLM cost)
-  if (await isGuardian(lineUserId) && DASHBOARD_TRIGGERS.some(t => userMessage.includes(t))) {
+  // ── check_patient (guardian dashboard) ────────────────────
+  if (intent === 'check_patient' && guardianUser) {
     const card = await buildDashboardCard(lineUserId);
     if (card) {
       await client.replyMessage({ replyToken: event.replyToken, messages: [card] });
       return;
     }
+    // No data yet — fall through to Claude for a natural reply
   }
 
-
-  // Medication list request → show Flex card, no Claude call
-  if (MED_LIST_TRIGGERS.some(t => userMessage.includes(t))) {
+  // ── check_med_list ─────────────────────────────────────────
+  if (intent === 'check_med_list') {
     const card = await buildMedCard(patientId, '💊 รายการยาของคุณ');
     await client.replyMessage({ replyToken: event.replyToken, messages: [card] });
     await incrementQuota(patientId, 'message');
     return;
   }
 
-  // Appointment booking detection
-  if (APPT_TRIGGERS.some(t => userMessage.includes(t))) {
+  // ── book_appointment ───────────────────────────────────────
+  if (intent === 'book_appointment') {
     const appt = await parseAndSaveAppointment(patientId, userMessage);
     if (appt) {
       const timeStr = appt.datetime.toLocaleString('th-TH', {
@@ -2090,11 +2122,11 @@ async function handleTextMessage(event, patientId) {
       await incrementQuota(patientId, 'message');
       return;
     }
-    // Could not parse — let Claude handle it naturally
+    // Haiku couldn't extract date — fall through to Claude for natural handling
   }
 
-  // Medication taken confirmation
-  if (isTakenConfirmation(userMessage)) {
+  // ── med_taken ──────────────────────────────────────────────
+  if (intent === 'med_taken') {
     const takenResult = await pool.query(
       `UPDATE medication_logs SET status='taken', responded_at=NOW()
        WHERE patient_id=$1 AND status='missed'
@@ -2102,20 +2134,50 @@ async function handleTextMessage(event, patientId) {
        RETURNING medication_id`,
       [patientId]
     );
-    // Decrement pills_remaining for each confirmed dose
     for (const row of takenResult.rows) {
       await pool.query(
-        `UPDATE medications
-         SET pills_remaining = GREATEST(pills_remaining - 1, 0)
+        `UPDATE medications SET pills_remaining = GREATEST(pills_remaining - 1, 0)
          WHERE id=$1 AND pills_remaining IS NOT NULL`,
         [row.medication_id]
       );
     }
-    medCache.delete(patientId); // refresh cache so pill count stays current
+    medCache.delete(patientId);
+    // Fall through to Claude for the warm acknowledgement reply
   }
 
-  // Health reading detection
-  const reading = parseHealthReading(userMessage);
+  // ── med_snooze ─────────────────────────────────────────────
+  if (intent === 'med_snooze') {
+    // Just acknowledge — Claude handles the warm reply below
+    // No DB write needed; log stays 'missed' until confirmed
+  }
+
+  // ── log_reading — use entities if Haiku extracted values ──
+  // Otherwise fall back to regex parser
+  let reading = null;
+  if (intent === 'log_reading' && entities?.type && entities?.value_1) {
+    // Convert mmol glucose to mg/dL if needed
+    const v1 = parseFloat(entities.value_1);
+    const v2 = entities.value_2 ? parseFloat(entities.value_2) : null;
+    let mgVal = v1;
+    if (entities.type === 'glucose' && v1 <= 30) mgVal = parseFloat((v1 * 18).toFixed(0));
+
+    reading = {
+      type: entities.type,
+      value_1: entities.type === 'glucose' ? mgVal : v1,
+      value_2: v2,
+      unit: entities.unit || '',
+      alert_level: entities.type === 'bp' ? classifyBP(v1, v2 || 0)
+        : entities.type === 'spo2'    ? classifySpO2(v1)
+        : entities.type === 'temp'    ? classifyTemp(v1)
+        : entities.type === 'glucose' ? classifyGlucose(mgVal)
+        : 'pending',
+    };
+  } else {
+    // Fallback regex for any reading-like text the router might have missed
+    reading = parseHealthReading(userMessage);
+  }
+
+  // ── All non-shortcut intents hit Claude for the reply ─────
   const history = await loadHistory(patientId);
   history.push({ role: 'user', content: userMessage });
 
@@ -2126,7 +2188,8 @@ async function handleTextMessage(event, patientId) {
     messages: history,
   });
 
-  const reply = response.content.find(b => b.type === 'text')?.text ?? 'ขอโทษครับ ลุงไม่เข้าใจ ลองพิมพ์ใหม่อีกครั้งนะครับ';
+  const reply = response.content.find(b => b.type === 'text')?.text
+    ?? 'ขอโทษครับ ลุงไม่เข้าใจ ลองพิมพ์ใหม่อีกครั้งนะครับ';
 
   let weightChangeMsg = null;
   if (reading) {
@@ -2184,6 +2247,7 @@ async function handleImageMessage(event, patientId) {
     }
 
 
+    const history = await loadHistory(patientId);
     const response = await anthropic.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 400,
