@@ -1287,7 +1287,7 @@ async function getMedicationsDue() {
   const hh = String(bkk.getUTCHours()).padStart(2, '0');
   const mm = String(bkk.getUTCMinutes()).padStart(2, '0');
   const result = await pool.query(
-    `SELECT m.id as medication_id, m.name, m.dosage, p.id as patient_id, p.line_user_id, p.display_name
+    `SELECT m.id as medication_id, m.name, m.dosage, p.id as patient_id, p.line_user_id, p.display_name, p.language
      FROM medications m JOIN patients p ON p.id=m.patient_id
      WHERE m.active=TRUE AND p.line_user_id IS NOT NULL AND $1=ANY(m.schedule)`,
     [`${hh}:${mm}`]
@@ -1302,9 +1302,10 @@ cron.schedule('* * * * *', async () => {
     console.log(`⏰ ${meds.length} med(s) due`);
     for (const med of meds) {
       try {
-        const name = med.display_name ? ` คุณ${med.display_name}` : '';
+        const l = med.language === 'en' ? 'en' : 'th';
+        const name = med.display_name ? (l === 'en' ? ` ${med.display_name}` : ` คุณ${med.display_name}`) : '';
         await client.pushMessage({ to: med.line_user_id, messages: [{ type: 'text',
-          text: `💊 ถึงเวลากินยาแล้ว${name}ครับ\nยา: ${med.name}${med.dosage ? ` ${med.dosage}` : ''}\nกินเสร็จแล้วตอบ "กินแล้ว" ให้ลุงทราบด้วยนะครับ 🙏` }]});
+          text: S(l, 'reminder_push', name, med.name, med.dosage) }]});
         await pool.query(`INSERT INTO medication_logs (medication_id, patient_id, status, scheduled_at) VALUES ($1,$2,'missed',$3)`, [med.medication_id, med.patient_id, new Date()]);
         console.log(`✅ Reminder: ${med.name} → ${med.line_user_id}`);
       } catch (err) { console.error(`❌ Reminder failed ${med.name}:`, err.message); }
@@ -1413,7 +1414,7 @@ cron.schedule('*/5 * * * *', async () => {
     const needsFollowUp = await pool.query(
       `SELECT ml.id, ml.medication_id, ml.patient_id, ml.scheduled_at,
               m.name, m.dosage,
-              p.line_user_id, p.display_name
+              p.line_user_id, p.display_name, p.language
        FROM medication_logs ml
        JOIN medications m ON m.id = ml.medication_id
        JOIN patients p ON p.id = ml.patient_id
@@ -1427,16 +1428,13 @@ cron.schedule('*/5 * * * *', async () => {
 
     for (const row of needsFollowUp.rows) {
       try {
-        const name = row.display_name ? ` คุณ${row.display_name}` : '';
+        const l = row.language === 'en' ? 'en' : 'th';
+        const name = row.display_name ? (l === 'en' ? ` ${row.display_name}` : ` คุณ${row.display_name}`) : '';
         await client.pushMessage({
           to: row.line_user_id,
-          messages: [{ type: 'text',
-            text: `🔔 ลุงโน้ตเป็นห่วงนะครับ${name}\nยัง${row.name}${row.dosage ? ` ${row.dosage}` : ''} ยังไม่ได้กินใช่ไหมครับ?\nถ้ากินแล้วตอบ "กินแล้ว" ได้เลยครับ 💊` }],
+          messages: [{ type: 'text', text: S(l, 'followup_push', name, row.name, row.dosage) }],
         });
-        await pool.query(
-          `UPDATE medication_logs SET followup_sent=TRUE WHERE id=$1`,
-          [row.id]
-        );
+        await pool.query(`UPDATE medication_logs SET followup_sent=TRUE WHERE id=$1`, [row.id]);
         console.log(`🔔 Follow-up sent: ${row.name} → ${row.line_user_id}`);
       } catch (err) { console.error(`❌ Follow-up failed:`, err.message); }
     }
@@ -1445,7 +1443,7 @@ cron.schedule('*/5 * * * *', async () => {
     const confirmedMissed = await pool.query(
       `SELECT ml.id, ml.medication_id, ml.patient_id, ml.scheduled_at,
               m.name, m.dosage,
-              p.line_user_id, p.display_name
+              p.line_user_id, p.display_name, p.language
        FROM medication_logs ml
        JOIN medications m ON m.id = ml.medication_id
        JOIN patients p ON p.id = ml.patient_id
@@ -1460,7 +1458,7 @@ cron.schedule('*/5 * * * *', async () => {
 
     for (const row of confirmedMissed.rows) {
       try {
-        // Notify guardian if one exists
+        const patientLabel = row.display_name ? `คุณ${row.display_name}` : `ผู้ใช้ ...${row.patient_id.slice(-6)}`;
         const guardian = await pool.query(
           `SELECT g.line_user_id, g.notification_level
            FROM guardians g
@@ -1469,9 +1467,7 @@ cron.schedule('*/5 * * * *', async () => {
            WHERE p.id = $1 AND g.line_user_id IS NOT NULL`,
           [row.patient_id]
         );
-
         if (guardian.rows.length > 0 && guardian.rows[0].notification_level !== 'summary_only') {
-          const patientLabel = row.display_name ? `คุณ${row.display_name}` : `ผู้ใช้ ...${row.patient_id.slice(-6)}`;
           await client.pushMessage({
             to: guardian.rows[0].line_user_id,
             messages: [{ type: 'text',
@@ -1479,11 +1475,7 @@ cron.schedule('*/5 * * * *', async () => {
           });
           console.log(`📲 Missed dose guardian notified: ${row.name}`);
         }
-
-        await pool.query(
-          `UPDATE medication_logs SET guardian_notified=TRUE WHERE id=$1`,
-          [row.id]
-        );
+        await pool.query(`UPDATE medication_logs SET guardian_notified=TRUE WHERE id=$1`, [row.id]);
       } catch (err) { console.error(`❌ Missed dose notify failed:`, err.message); }
     }
 
@@ -1503,7 +1495,7 @@ cron.schedule('0 2 * * *', async () => {
   try {
     const lowMeds = await pool.query(
       `SELECT m.id, m.name, m.dosage, m.pills_remaining, m.refill_alert_at,
-              p.id as patient_id, p.line_user_id, p.display_name,
+              p.id as patient_id, p.line_user_id, p.display_name, p.language,
               r.id as reminder_id
        FROM medications m
        JOIN patients p ON p.id = m.patient_id
@@ -1522,7 +1514,8 @@ cron.schedule('0 2 * * *', async () => {
 
     for (const med of lowMeds.rows) {
       try {
-        const name = med.display_name ? ` คุณ${med.display_name}` : '';
+        const l = med.language === 'en' ? 'en' : 'th';
+        const name = med.display_name ? (l === 'en' ? ` ${med.display_name}` : ` คุณ${med.display_name}`) : '';
         const doseResult = await pool.query(
           `SELECT array_length(schedule,1) as doses FROM medications WHERE id=$1`, [med.id]
         );
@@ -1531,17 +1524,11 @@ cron.schedule('0 2 * * *', async () => {
 
         await client.pushMessage({
           to: med.line_user_id,
-          messages: [{ type: 'text',
-            text: `⚠️ ยา${med.name}${med.dosage ? ` ${med.dosage}` : ''} ใกล้หมดแล้วครับ${name}\nเหลืออยู่ประมาณ ${daysLeft} วันครับ\nอย่าลืมขอยาเพิ่มจากแพทย์ด้วยนะครับ 🏥` }],
+          messages: [{ type: 'text', text: S(l, 'refill_push', name, med.name, med.dosage, daysLeft) }],
         });
 
-        // Log reminder sent
-        await pool.query(
-          `INSERT INTO refill_reminders (medication_id, sent, sent_at) VALUES ($1, TRUE, NOW())`,
-          [med.id]
-        );
+        await pool.query(`INSERT INTO refill_reminders (medication_id, sent, sent_at) VALUES ($1, TRUE, NOW())`, [med.id]);
 
-        // Also notify guardian
         const guardian = await pool.query(
           `SELECT g.line_user_id FROM guardians g
            JOIN households h ON h.id=g.household_id
@@ -1581,7 +1568,7 @@ cron.schedule('0 * * * *', async () => {
     // Find appointments needing 48h reminder
     const need48h = await pool.query(
       `SELECT a.id, a.title, a.appointment_at, a.patient_id,
-              p.line_user_id, p.display_name
+              p.line_user_id, p.display_name, p.language
        FROM appointment_reminders a
        JOIN patients p ON p.id = a.patient_id
        WHERE a.reminder_48h_sent = FALSE
@@ -1594,24 +1581,14 @@ cron.schedule('0 * * * *', async () => {
 
     for (const appt of need48h.rows) {
       try {
+        const l = appt.language === 'en' ? 'en' : 'th';
+        const locale = l === 'en' ? 'en-GB' : 'th-TH';
         const apptTime = new Date(new Date(appt.appointment_at).getTime() + 7 * 3600000);
-        const timeStr = apptTime.toLocaleString('th-TH', {
-          weekday: 'long', month: 'long', day: 'numeric',
-          hour: '2-digit', minute: '2-digit',
-        });
-        const name = appt.display_name ? ` คุณ${appt.display_name}` : '';
-
-        await client.pushMessage({
-          to: appt.line_user_id,
-          messages: [{ type: 'text',
-            text: `📅 แจ้งเตือนนัดแพทย์${name}ครับ\n${appt.title}\n🕐 ${timeStr}\n\nอีก 2 วันแล้วนะครับ อย่าลืมเตรียมตัวด้วยนะครับ 😊` }],
-        });
-
+        const timeStr = apptTime.toLocaleString(locale, { weekday: 'long', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+        const name = appt.display_name ? (l === 'en' ? ` ${appt.display_name}` : ` คุณ${appt.display_name}`) : '';
+        await client.pushMessage({ to: appt.line_user_id, messages: [{ type: 'text', text: S(l, 'appt_48h', name, appt.title, timeStr) }] });
         await notifyGuardianAppt(appt, 48);
-        await pool.query(
-          `UPDATE appointment_reminders SET reminder_48h_sent=TRUE WHERE id=$1`,
-          [appt.id]
-        );
+        await pool.query(`UPDATE appointment_reminders SET reminder_48h_sent=TRUE WHERE id=$1`, [appt.id]);
         console.log(`📅 48h reminder sent: ${appt.title}`);
       } catch (err) { console.error('❌ 48h reminder failed:', err.message); }
     }
@@ -1619,7 +1596,7 @@ cron.schedule('0 * * * *', async () => {
     // Find appointments needing 24h reminder
     const need24h = await pool.query(
       `SELECT a.id, a.title, a.appointment_at, a.patient_id,
-              p.line_user_id, p.display_name
+              p.line_user_id, p.display_name, p.language
        FROM appointment_reminders a
        JOIN patients p ON p.id = a.patient_id
        WHERE a.reminder_24h_sent = FALSE
@@ -1632,23 +1609,14 @@ cron.schedule('0 * * * *', async () => {
 
     for (const appt of need24h.rows) {
       try {
+        const l = appt.language === 'en' ? 'en' : 'th';
+        const locale = l === 'en' ? 'en-GB' : 'th-TH';
         const apptTime = new Date(new Date(appt.appointment_at).getTime() + 7 * 3600000);
-        const timeStr = apptTime.toLocaleString('th-TH', {
-          weekday: 'long', hour: '2-digit', minute: '2-digit',
-        });
-        const name = appt.display_name ? ` คุณ${appt.display_name}` : '';
-
-        await client.pushMessage({
-          to: appt.line_user_id,
-          messages: [{ type: 'text',
-            text: `📅 แจ้งเตือนนัดแพทย์${name}ครับ\n${appt.title}\n🕐 พรุ่งนี้ ${timeStr}\n\nอย่าลืมนะครับ 🏥 และอย่าลืมนำบัตรประชาชน + ประวัติยาไปด้วยครับ` }],
-        });
-
+        const timeStr = apptTime.toLocaleString(locale, { weekday: 'long', hour: '2-digit', minute: '2-digit' });
+        const name = appt.display_name ? (l === 'en' ? ` ${appt.display_name}` : ` คุณ${appt.display_name}`) : '';
+        await client.pushMessage({ to: appt.line_user_id, messages: [{ type: 'text', text: S(l, 'appt_24h', name, appt.title, timeStr) }] });
         await notifyGuardianAppt(appt, 24);
-        await pool.query(
-          `UPDATE appointment_reminders SET reminder_24h_sent=TRUE WHERE id=$1`,
-          [appt.id]
-        );
+        await pool.query(`UPDATE appointment_reminders SET reminder_24h_sent=TRUE WHERE id=$1`, [appt.id]);
         console.log(`📅 24h reminder sent: ${appt.title}`);
       } catch (err) { console.error('❌ 24h reminder failed:', err.message); }
     }
