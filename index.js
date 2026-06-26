@@ -507,6 +507,30 @@ const S = (lang, key, ...args) => {
     invite_expired: { th: 'ขอโทษครับ ลิงก์หมดอายุแล้ว (ใช้ได้แค่ 24 ชั่วโมง) ขอให้ลูกหลานสร้างลิงก์ใหม่ให้นะครับ', en: 'Sorry, this link has expired (valid for 24 hours). Please ask your family to send a new one.' },
     invite_linked:  { th: 'คุณเชื่อมต่อกับลุงโน้ตอยู่แล้วนะครับ 😊 พิมพ์มาคุยกับลุงได้เลยครับ', en: 'You\'re already connected to Uncle Note 😊 Feel free to chat!' },
     invite_invalid: { th: 'ขอโทษครับ ลิงก์ไม่ถูกต้อง ขอให้ลูกหลานส่งลิงก์ใหม่ให้นะครับ', en: 'Sorry, this link is not valid. Please ask your family to send a new one.' },
+
+    // Guardian alert pushes
+    guardian_alert: {
+      th: (emoji, label, reading, urgency) => `${emoji} แจ้งเตือนจากลุงโน้ต\n${label}: ${reading}\n${urgency}ครับ`,
+      en: (emoji, label, reading, urgency) => `${emoji} Uncle Note Alert\n${label}: ${reading}\n${urgency}`,
+    },
+    guardian_alert_urgency_urgent: { th: 'ค่าผิดปกติ — ควรพบแพทย์โดยเร็ว', en: 'Abnormal reading — please see a doctor soon' },
+    guardian_alert_urgency_watch:  { th: 'ค่าที่ควรติดตาม', en: 'Value to keep an eye on' },
+    guardian_missed_dose: {
+      th: (label, med, dosage, time) => `⚠️ แจ้งเตือนจากลุงโน้ต\n${label} ยังไม่ได้กิน${med}${dosage ? ` ${dosage}` : ''} ครับ\n(กำหนดเวลา ${time} น.)`,
+      en: (label, med, dosage, time) => `⚠️ Uncle Note Alert\n${label} hasn't taken ${med}${dosage ? ` ${dosage}` : ''}\n(Scheduled at ${time})`,
+    },
+    guardian_refill: {
+      th: (label, med, days) => `⚠️ แจ้งเตือนจากลุงโน้ต\nยา${med} ของ${label}ใกล้หมดแล้วครับ (เหลือ ~${days} วัน)\nช่วยพา${label}ไปขอยาเพิ่มด้วยนะครับ 🏥`,
+      en: (label, med, days) => `⚠️ Uncle Note Alert\n${label}'s ${med} is running low (~${days} days left)\nPlease help them get a refill 🏥`,
+    },
+    guardian_appt: {
+      th: (label, hours, title, time) => `📅 แจ้งเตือนจากลุงโน้ต\n${label} มีนัดแพทย์ใน ${hours} ชั่วโมงครับ\n${title}\n🕐 ${time}`,
+      en: (label, hours, title, time) => `📅 Uncle Note Reminder\n${label} has an appointment in ${hours} hours\n${title}\n🕐 ${time}`,
+    },
+    guardian_invite_accepted: {
+      th: (patientName, guardianName) => `✅ คุณ${patientName}เชื่อมต่อกับลุงโน้ตแล้วครับ!\nลุงพร้อมดูแลและส่งรายงานให้คุณ${guardianName}แล้วนะครับ 😊`,
+      en: (patientName, guardianName) => `✅ ${patientName} is now connected to Uncle Note!\nI'll look after them and keep you${guardianName ? `, ${guardianName},` : ''} updated 😊`,
+    },
   };
 
   const entry = strings[key];
@@ -615,10 +639,10 @@ async function handleOnboarding(event, patient) {
       const householdId = hhResult.rows[0].household_id;
       await pool.query(`UPDATE households SET mode='guardian' WHERE id=$1`, [householdId]);
       await pool.query(
-        `INSERT INTO guardians (household_id, line_user_id, display_name, notification_level)
-         VALUES ($1, $2, $3, 'realtime')
-         ON CONFLICT (household_id) DO UPDATE SET line_user_id=$2`,
-        [householdId, lineUserId, patient.display_name]
+        `INSERT INTO guardians (household_id, line_user_id, display_name, notification_level, language)
+         VALUES ($1, $2, $3, 'realtime', $4)
+         ON CONFLICT (household_id) DO UPDATE SET line_user_id=$2, language=$4`,
+        [householdId, lineUserId, patient.display_name, l]
       );
       await setOnboardingState(patientId, 'guardian_asking_patient_name');
       await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'family_intro') }]});
@@ -1142,7 +1166,8 @@ async function saveHealthLog(patientId, reading, source = 'chat') {
 async function notifyGuardian(patientId, reading, alertId) {
   try {
     const result = await pool.query(
-      `SELECT g.line_user_id, g.notification_level, p.display_name as patient_name
+      `SELECT g.line_user_id, g.notification_level, g.language as guardian_language,
+              p.display_name as patient_name
        FROM guardians g JOIN households h ON h.id=g.household_id JOIN patients p ON p.household_id=h.id
        WHERE p.id=$1 AND g.line_user_id IS NOT NULL`,
       [patientId]
@@ -1151,19 +1176,28 @@ async function notifyGuardian(patientId, reading, alertId) {
     const g = result.rows[0];
     if (g.notification_level === 'summary_only' || (g.notification_level === 'daily' && reading.alert_level === 'watch')) return;
 
-    const patientLabel = g.patient_name ? `คุณ${g.patient_name}` : `ผู้ใช้ ...${patientId.slice(-6)}`;
+    const gl = g.guardian_language === 'en' ? 'en' : 'th';
+    const patientLabel = g.patient_name
+      ? (gl === 'en' ? g.patient_name : `คุณ${g.patient_name}`)
+      : `...${patientId.slice(-6)}`;
     const emoji = reading.alert_level === 'urgent' ? '🚨' : '⚠️';
-    const urgency = reading.alert_level === 'urgent' ? 'ค่าผิดปกติ — ควรพบแพทย์โดยเร็ว' : 'ค่าที่ควรติดตาม';
+    const urgency = S(gl, reading.alert_level === 'urgent' ? 'guardian_alert_urgency_urgent' : 'guardian_alert_urgency_watch');
+
+    const READING_LABELS = {
+      th: { bp: 'ความดัน', glucose: 'น้ำตาล', spo2: 'ออกซิเจน', temp: 'อุณหภูมิ', weight: 'น้ำหนัก' },
+      en: { bp: 'Blood pressure', glucose: 'Blood sugar', spo2: 'Oxygen', temp: 'Temperature', weight: 'Weight' },
+    };
+    const label = READING_LABELS[gl][reading.type] || reading.type;
 
     let readingText = '';
-    if (reading.type === 'bp') readingText = `ความดัน ${reading.value_1}/${reading.value_2} mmHg`;
-    else if (reading.type === 'glucose') readingText = `น้ำตาล ${reading.value_1} mg/dL`;
-    else if (reading.type === 'spo2') readingText = `ออกซิเจน ${reading.value_1}%`;
-    else if (reading.type === 'temp') readingText = `อุณหภูมิ ${reading.value_1}°C`;
-    else if (reading.type === 'weight') readingText = `น้ำหนัก ${reading.value_1} กก${reading.value_2 ? ` (${reading.value_2 > 0 ? '+' : ''}${reading.value_2} กก)` : ''}`;
+    if (reading.type === 'bp')      readingText = `${reading.value_1}/${reading.value_2} mmHg`;
+    else if (reading.type === 'glucose') readingText = `${reading.value_1} mg/dL`;
+    else if (reading.type === 'spo2')    readingText = `${reading.value_1}%`;
+    else if (reading.type === 'temp')    readingText = `${reading.value_1}°C`;
+    else if (reading.type === 'weight')  readingText = `${reading.value_1} kg${reading.value_2 ? ` (${reading.value_2 > 0 ? '+' : ''}${reading.value_2} kg)` : ''}`;
 
     await client.pushMessage({ to: g.line_user_id, messages: [{ type: 'text',
-      text: `${emoji} แจ้งเตือนจากลุงโน้ต\n${patientLabel}: ${readingText}\n${urgency}ครับ` }]});
+      text: S(gl, 'guardian_alert', emoji, `${patientLabel}: ${label}`, readingText, urgency) }]});
     await pool.query(`UPDATE alerts SET guardian_notified=TRUE WHERE id=$1`, [alertId]);
     console.log(`📲 Guardian notified: ${reading.type} ${reading.alert_level}`);
   } catch (err) { console.error('Guardian notify failed:', err.message); }
@@ -1458,9 +1492,8 @@ cron.schedule('*/5 * * * *', async () => {
 
     for (const row of confirmedMissed.rows) {
       try {
-        const patientLabel = row.display_name ? `คุณ${row.display_name}` : `ผู้ใช้ ...${row.patient_id.slice(-6)}`;
         const guardian = await pool.query(
-          `SELECT g.line_user_id, g.notification_level
+          `SELECT g.line_user_id, g.notification_level, g.language as guardian_language
            FROM guardians g
            JOIN households h ON h.id = g.household_id
            JOIN patients p ON p.household_id = h.id
@@ -1468,10 +1501,15 @@ cron.schedule('*/5 * * * *', async () => {
           [row.patient_id]
         );
         if (guardian.rows.length > 0 && guardian.rows[0].notification_level !== 'summary_only') {
+          const gl = guardian.rows[0].guardian_language === 'en' ? 'en' : 'th';
+          const patientLabel = row.display_name
+            ? (gl === 'en' ? row.display_name : `คุณ${row.display_name}`)
+            : `...${row.patient_id.slice(-6)}`;
+          const scheduledTime = new Date(new Date(row.scheduled_at).getTime() + 7*3600000)
+            .toLocaleTimeString(gl === 'en' ? 'en-GB' : 'th-TH', { hour: '2-digit', minute: '2-digit' });
           await client.pushMessage({
             to: guardian.rows[0].line_user_id,
-            messages: [{ type: 'text',
-              text: `⚠️ แจ้งเตือนจากลุงโน้ต\n${patientLabel} ยังไม่ได้กิน${row.name}${row.dosage ? ` ${row.dosage}` : ''} ครับ\n(กำหนดเวลา ${new Date(new Date(row.scheduled_at).getTime() + 7*3600000).toLocaleTimeString('th-TH', {hour:'2-digit',minute:'2-digit'})} น.)` }],
+            messages: [{ type: 'text', text: S(gl, 'guardian_missed_dose', patientLabel, row.name, row.dosage, scheduledTime) }],
           });
           console.log(`📲 Missed dose guardian notified: ${row.name}`);
         }
@@ -1530,18 +1568,20 @@ cron.schedule('0 2 * * *', async () => {
         await pool.query(`INSERT INTO refill_reminders (medication_id, sent, sent_at) VALUES ($1, TRUE, NOW())`, [med.id]);
 
         const guardian = await pool.query(
-          `SELECT g.line_user_id FROM guardians g
+          `SELECT g.line_user_id, g.language as guardian_language FROM guardians g
            JOIN households h ON h.id=g.household_id
            JOIN patients p ON p.household_id=h.id
            WHERE p.id=$1 AND g.line_user_id IS NOT NULL`,
           [med.patient_id]
         );
         if (guardian.rows.length > 0) {
-          const patientLabel = med.display_name ? `คุณ${med.display_name}` : `ผู้ใช้ ...${med.patient_id.slice(-6)}`;
+          const gl = guardian.rows[0].guardian_language === 'en' ? 'en' : 'th';
+          const patientLabel = med.display_name
+            ? (gl === 'en' ? med.display_name : `คุณ${med.display_name}`)
+            : `...${med.patient_id.slice(-6)}`;
           await client.pushMessage({
             to: guardian.rows[0].line_user_id,
-            messages: [{ type: 'text',
-              text: `⚠️ แจ้งเตือนจากลุงโน้ต\nยา${med.name} ของ${patientLabel}ใกล้หมดแล้วครับ (เหลือ ~${daysLeft} วัน)\nช่วยพา${patientLabel}ไปขอยาเพิ่มด้วยนะครับ 🏥` }],
+            messages: [{ type: 'text', text: S(gl, 'guardian_refill', patientLabel, med.name, daysLeft) }],
           });
         }
 
@@ -1627,7 +1667,7 @@ cron.schedule('0 * * * *', async () => {
 async function notifyGuardianAppt(appt, hours) {
   try {
     const guardian = await pool.query(
-      `SELECT g.line_user_id FROM guardians g
+      `SELECT g.line_user_id, g.language as guardian_language FROM guardians g
        JOIN households h ON h.id=g.household_id
        JOIN patients p ON p.household_id=h.id
        WHERE p.id=$1 AND g.line_user_id IS NOT NULL`,
@@ -1635,17 +1675,17 @@ async function notifyGuardianAppt(appt, hours) {
     );
     if (guardian.rows.length === 0) return;
 
+    const gl = guardian.rows[0].guardian_language === 'en' ? 'en' : 'th';
+    const locale = gl === 'en' ? 'en-GB' : 'th-TH';
     const apptTime = new Date(new Date(appt.appointment_at).getTime() + 7 * 3600000);
-    const timeStr = apptTime.toLocaleString('th-TH', {
-      weekday: 'long', month: 'long', day: 'numeric',
-      hour: '2-digit', minute: '2-digit',
-    });
-    const patientLabel = appt.display_name ? `คุณ${appt.display_name}` : 'ผู้ที่คุณดูแล';
+    const timeStr = apptTime.toLocaleString(locale, { weekday: 'long', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    const patientLabel = appt.display_name
+      ? (gl === 'en' ? appt.display_name : `คุณ${appt.display_name}`)
+      : (gl === 'en' ? 'your parent' : 'ผู้ที่คุณดูแล');
 
     await client.pushMessage({
       to: guardian.rows[0].line_user_id,
-      messages: [{ type: 'text',
-        text: `📅 แจ้งเตือนจากลุงโน้ต\n${patientLabel} มีนัดแพทย์ใน ${hours} ชั่วโมงครับ\n${appt.title}\n🕐 ${timeStr}` }],
+      messages: [{ type: 'text', text: S(gl, 'guardian_appt', patientLabel, hours, appt.title, timeStr) }],
     });
   } catch (err) { console.error('❌ Guardian appt notify:', err.message); }
 }
@@ -1889,17 +1929,17 @@ async function handleInviteToken(lineUserId, token) {
 
   // Notify the guardian
   const guardianResult = await pool.query(
-    `SELECT g.line_user_id, g.display_name FROM guardians g
+    `SELECT g.line_user_id, g.display_name, g.language as guardian_language FROM guardians g
      WHERE g.household_id=$1`, [row.household_id]
   );
 
   if (guardianResult.rows.length > 0) {
+    const gl = guardianResult.rows[0].guardian_language === 'en' ? 'en' : 'th';
     const guardianName = guardianResult.rows[0].display_name || '';
-    const patientLabel = row.display_name || 'ท่าน';
+    const patientLabel = row.display_name || (gl === 'en' ? 'your parent' : 'ท่าน');
     await client.pushMessage({
       to: guardianResult.rows[0].line_user_id,
-      messages: [{ type: 'text',
-        text: `✅ คุณ${patientLabel}เชื่อมต่อกับลุงโน้ตแล้วครับ!\nลุงพร้อมดูแลและส่งรายงานให้คุณ${guardianName}แล้วนะครับ 😊` }],
+      messages: [{ type: 'text', text: S(gl, 'guardian_invite_accepted', patientLabel, guardianName) }],
     });
   }
 
