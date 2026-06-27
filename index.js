@@ -1275,6 +1275,68 @@ function classifyGlucose(v) { return v > 270 ? 'urgent' : v > 180 ? 'watch' : v 
 function classifyWeightChange(c) { const a = Math.abs(c); return a >= 2 ? 'urgent' : a >= 1 ? 'watch' : 'normal'; }
 
 // ============================================================
+// TEMPLATED REPLIES — deterministic, zero-LLM replies for the
+// high-volume, low-nuance intents (med taken/snooze, plain readings).
+// Sonnet (and its cost + safety judgement) is reserved for anything
+// carrying a question, symptom, or clinical nuance.
+// ============================================================
+
+// A reading bundled with a question must still go to Sonnet so it can
+// actually answer ("150/95 สูงไปไหม"). Plain readings ("130/85",
+// "ความดัน 130/85") carry no question marker and are safe to template.
+const QUESTION_RE = /[?？]|ไหม|มั้ย|ยังไง|ทำไง|ทำยังไง|หรือเปล่า|สูงไป|ต่ำไป|อันตราย|ปกติไหม|ดีไหม|น่าห่วง|เป็นอะไร|กินได้|how|should|what|why|too high|too low|normal\?|ok\?|dangerous/i;
+
+const READING_LABELS_TPL = {
+  th: { bp: 'ความดัน', glucose: 'น้ำตาล', spo2: 'ออกซิเจน', temp: 'อุณหภูมิ', weight: 'น้ำหนัก' },
+  en: { bp: 'Blood pressure', glucose: 'Blood sugar', spo2: 'Oxygen', temp: 'Temperature', weight: 'Weight' },
+};
+
+function formatReadingValue(r) {
+  if (r.type === 'bp')      return `${r.value_1}/${r.value_2} mmHg`;
+  if (r.type === 'glucose') return `${r.value_1} mg/dL`;
+  if (r.type === 'spo2')    return `${r.value_1}%`;
+  if (r.type === 'temp')    return `${r.value_1}°C`;
+  if (r.type === 'weight')  return `${r.value_1} kg`;
+  return `${r.value_1}`;
+}
+
+// Warm acknowledgement for med taken / snooze.
+function templatedAck(intent, lang) {
+  const l = lang === 'en' ? 'en' : 'th';
+  if (intent === 'med_taken') {
+    return l === 'en'
+      ? "Great! I've noted your medication as taken 👍 Take care of yourself! 😊"
+      : 'เยี่ยมเลยครับ ลุงจดไว้แล้วว่ากินยาเรียบร้อย 👍 ดูแลสุขภาพต่อไปนะครับ 😊';
+  }
+  // med_snooze
+  return l === 'en'
+    ? 'Got it — reply "taken" once you\'ve had it and I\'ll note it down 🙏'
+    : 'รับทราบครับ เดี๋ยวกินแล้วพิมพ์ "กินแล้ว" บอกลุงด้วยนะครับ 🙏';
+}
+
+// Reading confirmation, keyed on alert_level. Never diagnoses — only
+// records the value and, when abnormal, gently suggests seeing a doctor.
+// For weight, the level line is omitted because the weightChangeMsg
+// (appended by the caller) already carries the detail.
+function templatedReadingReply(r, lang, fromPhoto = false) {
+  const l = lang === 'en' ? 'en' : 'th';
+  const label = READING_LABELS_TPL[l][r.type] || r.type;
+  const val = formatReadingValue(r);
+  if (l === 'en') {
+    const head = fromPhoto ? `📷 I read your ${label} as ${val}. Saved it for you.` : `Saved your ${label}: ${val}.`;
+    if (r.type === 'weight') return head;
+    if (r.alert_level === 'urgent') return `${head}\nThis reading is outside the usual range — I'm a bit concerned, please see a doctor soon 🙏`;
+    if (r.alert_level === 'watch')  return `${head}\nA little outside the usual range — worth keeping an eye on. If it stays like this, do check with your doctor.`;
+    return `${head}\nIt's within a normal range — you're taking good care of yourself 👍`;
+  }
+  const head = fromPhoto ? `📷 ลุงอ่านค่า${label}ได้ ${val} ครับ บันทึกไว้ให้แล้ว` : `บันทึกค่า${label} ${val} ให้แล้วครับ`;
+  if (r.type === 'weight') return head;
+  if (r.alert_level === 'urgent') return `${head}\nค่านี้อยู่นอกเกณฑ์ปกติ ลุงเป็นห่วงครับ แนะนำให้พบแพทย์โดยเร็วนะครับ 🙏`;
+  if (r.alert_level === 'watch')  return `${head}\nค่านี้สูงกว่าปกติเล็กน้อย ควรติดตามนะครับ ถ้าเป็นบ่อยลองปรึกษาคุณหมอครับ`;
+  return `${head}\nอยู่ในเกณฑ์ปกติครับ ดูแลตัวเองได้ดีมากครับ 👍`;
+}
+
+// ============================================================
 // HEALTH LOG SAVING + ALERTS
 // ============================================================
 
@@ -1602,8 +1664,10 @@ async function generateDailySummary(patientId, displayName) {
 
 เขียนสรุปสั้น ๆ 2-3 ประโยค ภาษาไทย อบอุ่น ตรงประเด็น ไม่วินิจฉัยโรค ถ้ามีค่าผิดปกติให้แนะนำพบแพทย์`;
 
+  // Sonnet, not Haiku: this summary is user-facing clinical prose (sent to
+  // patient/guardian). Once-a-day-per-patient, so the cost is trivial.
   const response = await anthropic.messages.create({
-    model: 'claude-haiku-4-5-20251001',
+    model: 'claude-sonnet-4-6',
     max_tokens: 200,
     messages: [{ role: 'user', content: prompt }],
   });
@@ -2531,6 +2595,35 @@ async function handleTextMessage(event, patientId) {
     reading = parseHealthReading(userMessage);
   }
 
+  // ── Templated replies — skip Sonnet for med taken/snooze and plain
+  //    readings. A reading bundled with a question still falls through to
+  //    Sonnet so it can actually answer; an unparsed reading does too.
+  if (intent === 'med_taken' || intent === 'med_snooze' ||
+      (intent === 'log_reading' && reading && !QUESTION_RE.test(userMessage))) {
+    const lr = await pool.query(`SELECT language FROM patients WHERE id=$1`, [patientId]);
+    const tl = lr.rows[0]?.language === 'en' ? 'en' : 'th';
+    let replyText;
+    if (intent === 'log_reading') {
+      const saved = await saveHealthLog(patientId, reading, 'chat');
+      replyText = templatedReadingReply(reading, tl);
+      if (saved.weightChangeMsg) replyText += `\n\n📊 ${saved.weightChangeMsg}`;
+    } else {
+      replyText = templatedAck(intent, tl);
+      // A med ack may also carry an embedded reading ("กินยาแล้ว 130/85") —
+      // save and confirm it too, matching the old fall-through behaviour.
+      if (reading) {
+        const saved = await saveHealthLog(patientId, reading, 'chat');
+        replyText += `\n\n${templatedReadingReply(reading, tl)}`;
+        if (saved.weightChangeMsg) replyText += `\n\n📊 ${saved.weightChangeMsg}`;
+      }
+    }
+    await saveMessage(patientId, 'user', userMessage, 'text');
+    await saveMessage(patientId, 'assistant', replyText, 'text');
+    await incrementQuota(patientId, 'message');
+    await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: replyText }] });
+    return;
+  }
+
   // ── All non-shortcut intents hit Claude for the reply ─────
   const history = await loadHistory(patientId);
   history.push({ role: 'user', content: userMessage });
@@ -2630,7 +2723,16 @@ async function handleImageMessage(event, patientId) {
       }
     } catch (e) { /* plain text reply */ }
 
-    if (photoReading) await saveHealthLog(patientId, photoReading, 'photo');
+    // When a reading was parsed, the user-facing confirmation comes from a
+    // deterministic template (keyed on alert_level) — not Haiku's prose,
+    // which can slip on tone/safety. Haiku still does the value reading.
+    if (photoReading) {
+      const saved = await saveHealthLog(patientId, photoReading, 'photo');
+      const lr = await pool.query(`SELECT language FROM patients WHERE id=$1`, [patientId]);
+      const tl = lr.rows[0]?.language === 'en' ? 'en' : 'th';
+      replyText = templatedReadingReply(photoReading, tl, true);
+      if (saved.weightChangeMsg) replyText += `\n\n📊 ${saved.weightChangeMsg}`;
+    }
 
     await saveMessage(patientId, 'user', '[ผู้ใช้ส่งรูปภาพมาให้ลุงอ่าน]', 'image_summary');
     await saveMessage(patientId, 'assistant', replyText, 'text');
