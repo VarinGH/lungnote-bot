@@ -4,6 +4,7 @@ import * as line from '@line/bot-sdk';
 import Anthropic from '@anthropic-ai/sdk';
 import pg from 'pg';
 import cron from 'node-cron';
+import crypto from 'crypto';
 
 const { Pool } = pg;
 
@@ -2032,12 +2033,14 @@ async function isGuardian(lineUserId) {
 // GUARDIAN INVITE LINK SYSTEM
 // ============================================================
 
-// Generate a cryptographically random token
+// Generate a cryptographically random token.
+// These tokens are the sole gate for binding a LINE account to a patient's
+// health record, so they MUST come from a CSPRNG — never Math.random().
 function generateToken() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
   let token = '';
   for (let i = 0; i < 24; i++) {
-    token += chars[Math.floor(Math.random() * chars.length)];
+    token += chars[crypto.randomInt(chars.length)];
   }
   return token;
 }
@@ -2102,12 +2105,29 @@ async function handleInviteToken(lineUserId, token) {
   if (row.used) return { success: false, reason: 'used' };
   if (new Date(row.expires_at) < new Date()) return { success: false, reason: 'expired' };
 
-  // Check if this LINE user already has a patient record
+  // Check if this LINE user already has a patient record.
+  // A brand-new invited user already owns an empty "shell" patient that the
+  // follow event auto-created (getOrCreatePatient). That shell must NOT block
+  // the invite — we detach it and move this LINE user onto the guardian's
+  // placeholder patient. Only a fully-onboarded patient is genuinely linked.
   const existingPatient = await pool.query(
-    `SELECT id FROM patients WHERE line_user_id=$1`, [lineUserId]
+    `SELECT id, onboarding_state FROM patients WHERE line_user_id=$1`, [lineUserId]
   );
   if (existingPatient.rows.length > 0) {
-    return { success: false, reason: 'already_linked' };
+    const ex = existingPatient.rows[0];
+    if (ex.onboarding_state === 'complete') {
+      return { success: false, reason: 'already_linked' };
+    }
+    if (ex.id !== row.patient_id) {
+      // Detach the shell (clear line_user_id first to satisfy the unique
+      // constraint before we reassign it to the placeholder below).
+      await pool.query(
+        `UPDATE patients SET line_user_id=NULL, onboarding_state='superseded' WHERE id=$1`,
+        [ex.id]
+      );
+      clearProfile(ex.id);
+      medCache.delete(ex.id);
+    }
   }
 
   // Link this LINE user to the placeholder patient record
@@ -2225,6 +2245,22 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   }
 });
 
+// Consume an "INVITE_<token>" message and reply with the right status.
+// Called from handleEvent before onboarding routing.
+async function processInviteMessage(event, lineUserId) {
+  const token = event.message.text.trim().slice('INVITE_'.length).trim();
+  const result = await handleInviteToken(lineUserId, token);
+  // Language unknown at this point — use 'th' default, patient will set it in onboarding
+  const inviteLang = 'th';
+  let msg;
+  if (result.success)                   msg = S(inviteLang, 'invite_welcome', result.patientName);
+  else if (result.reason === 'used')    msg = S(inviteLang, 'invite_used');
+  else if (result.reason === 'expired') msg = S(inviteLang, 'invite_expired');
+  else if (result.reason === 'already_linked') msg = S(inviteLang, 'invite_linked');
+  else msg = S(inviteLang, 'invite_invalid');
+  await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: msg }]});
+}
+
 async function handleEvent(event) {
   // ── Follow event: user adds the bot ───────────────────────
   if (event.type === 'follow') {
@@ -2240,6 +2276,14 @@ async function handleEvent(event) {
   // Reset command works at any point — check before onboarding routing
   if (event.message.type === 'text' && event.message.text?.trim() === 'RESET_LUNGNOTE_DEV') {
     await handleTextMessage(event, patientId);
+    return;
+  }
+
+  // Invite token — MUST run before onboarding routing. The invited user
+  // already owns a shell patient (auto-created by the follow event), so they
+  // would otherwise be sent into self-onboarding and the token never consumed.
+  if (event.message.type === 'text' && event.message.text?.trim().startsWith('INVITE_')) {
+    await processInviteMessage(event, lineUserId);
     return;
   }
 
@@ -2373,21 +2417,8 @@ async function handleTextMessage(event, patientId) {
     return;
   }
 
-  // ── Invite token (always check before LLM — exact prefix match) ──
-  if (userMessage.startsWith('INVITE_')) {
-    const token = userMessage.replace('INVITE_', '').trim();
-    const result = await handleInviteToken(lineUserId, token);
-    // Language unknown at this point — use 'th' default, patient will set it in onboarding
-    const inviteLang = 'th';
-    let msg;
-    if (result.success)                msg = S(inviteLang, 'invite_welcome', result.patientName);
-    else if (result.reason === 'used') msg = S(inviteLang, 'invite_used');
-    else if (result.reason === 'expired') msg = S(inviteLang, 'invite_expired');
-    else if (result.reason === 'already_linked') msg = S(inviteLang, 'invite_linked');
-    else msg = S(inviteLang, 'invite_invalid');
-    await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: msg }]});
-    return;
-  }
+  // (Invite tokens are intercepted earlier in handleEvent, before onboarding
+  //  routing — they never reach this handler.)
 
   // ── Master intent router — one Haiku call routes everything ──
   const guardianUser = await isGuardian(lineUserId);
@@ -2617,4 +2648,5 @@ async function handleImageMessage(event, patientId) {
 // START
 // ============================================================
 
-app.listen(3000, () => console.log('✅ ลุงโน้ต is awake on port 3000!'));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`✅ ลุงโน้ต is awake on port ${PORT}!`));
