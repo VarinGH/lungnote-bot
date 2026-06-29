@@ -70,8 +70,8 @@ const TIME_LABELS = {
 // Single Haiku call replaces all keyword matching in handleTextMessage.
 // Returns { intent, entities } where intent is one of:
 //   med_taken | med_snooze | log_reading | add_med | update_med |
-//   book_appointment | check_patient | check_med_list | check_history |
-//   send_invite | other
+//   change_times | book_appointment | check_patient | check_med_list |
+//   check_history | send_invite | other
 // ============================================================
 
 async function routeIntent(text, isGuardianUser) {
@@ -92,7 +92,8 @@ INTENTS and when to use them:
 - "med_snooze": User acknowledging reminder but not yet taken. Examples: "เดี๋ยวกิน", "อีกครู่", "รอก่อน", "กำลังจะกิน"
 - "log_reading": User reporting a health measurement. Extract: type (bp/glucose/spo2/temp/weight), values. Examples: "130/85", "น้ำตาล 7.2", "วัดความดันได้ 120/80", "อุณหภูมิ 37.5", "น้ำหนัก 65 กิโล"
 - "add_med": User wants to add a new medication to their list. Examples: "เพิ่มยา", "มียาตัวใหม่", "ลืมบอกยา"
-- "update_med": User wants to change existing medication schedule or dose. Examples: "เปลี่ยนเวลายา", "ลดโดส", "หยุดยา", "แก้ยา"
+- "update_med": User wants to change a SPECIFIC medication's schedule or dose. Examples: "เปลี่ยนเวลายาความดัน", "ลดโดส", "หยุดยา", "แก้ยา"
+- "change_times": User wants to change their daily reminder time SLOTS (morning/midday/evening/bedtime) — the times reminders fire, not a specific drug. Examples: "เปลี่ยนเวลาเตือน", "แก้เวลาทานข้าว", "ตั้งเวลากินยาใหม่", "เปลี่ยนเวลาแจ้งเตือน", "change my reminder times", "edit meal times"
 - "book_appointment": User wants to record a doctor/hospital appointment. Examples: "นัดหมอ", "นัดตรวจ", "วันศุกร์ต้องไปโรงพยาบาล", "จำนัด"
 - "check_patient": GUARDIAN ONLY — wants to see patient health status/dashboard. Examples: "แม่เป็นยังไง", "ดูข้อมูลพ่อ", "รายงานวันนี้", "สุขภาพเป็นยังไง"
 - "check_med_list": User wants to see their medication list. Examples: "รายการยา", "มียาอะไรบ้าง", "ดูยา", "ยาทั้งหมด"
@@ -243,6 +244,22 @@ async function buildMedCard(patientId, headerText = '💊 รายการย�
 
 // Default meal/medication times used when a slot is missing.
 const DEFAULT_MEAL_TIMES = { morning: '08:00', midday: '12:00', evening: '18:00', bedtime: '21:00' };
+
+// Build the minimal { care_mode, names, meal_times } shape buildMealTimeCard
+// needs, from an already-onboarded patient row (post-onboarding edits).
+function mealProfileFromPatient(patient) {
+  return {
+    care_mode: patient.care_mode,
+    patient_name: patient.care_mode === 'family' ? patient.display_name : null,
+    self_name: patient.care_mode === 'family' ? null : patient.display_name,
+    meal_times: {
+      morning: String(patient.meal_morning || DEFAULT_MEAL_TIMES.morning).slice(0, 5),
+      midday:  String(patient.meal_midday  || DEFAULT_MEAL_TIMES.midday).slice(0, 5),
+      evening: String(patient.meal_evening || DEFAULT_MEAL_TIMES.evening).slice(0, 5),
+      bedtime: String(patient.meal_bedtime || DEFAULT_MEAL_TIMES.bedtime).slice(0, 5),
+    },
+  };
+}
 
 // buildMealLiffButton: a simple card whose button opens the LIFF mini-app where
 // the user sets all four times on one big, elderly-friendly screen. Used in
@@ -2686,13 +2703,16 @@ async function handlePostback(event) {
   const patient = await getOrCreatePatient(lineUserId);
   const patientId = patient.id;
 
-  // Only the onboarding meal-time card uses postbacks right now. Guard with
-  // the same onboarding check the other handlers use; anything else falls
-  // through untouched so future postback uses aren't broken.
-  if (!needsOnboarding(patient)) return;
+  // The meal-time card postbacks fire both during onboarding AND when an
+  // already-onboarded user re-opens the editor via "change_times". During
+  // onboarding we drive the in-memory profile + advance the flow; afterwards
+  // we write straight to the patients row and just acknowledge.
+  const onboarding = needsOnboarding(patient);
+  const profile = onboarding ? await getProfile(patient) : null;
+  const l = onboarding ? (profile.language || 'th') : lang(patient);
 
-  const profile = await getProfile(patient);
-  const l = profile.language || 'th';
+  // Ignore unrelated postbacks (keeps future postback uses safe).
+  if (!data.startsWith('edit_meal=') && data !== 'meal_times_confirmed') return;
 
   // 4a. A slot's time was edited via the time wheel.
   if (data.startsWith('edit_meal=')) {
@@ -2700,9 +2720,14 @@ async function handlePostback(event) {
     const time = event.postback.params?.time; // 'HH:MM'
     if (!['morning', 'midday', 'evening', 'bedtime'].includes(slot) || !time) return;
 
-    if (!profile.meal_times) profile.meal_times = { ...DEFAULT_MEAL_TIMES };
-    profile.meal_times[slot] = time;
-    await persistProfile(patientId, profile, lineUserId);
+    if (onboarding) {
+      if (!profile.meal_times) profile.meal_times = { ...DEFAULT_MEAL_TIMES };
+      profile.meal_times[slot] = time;
+      await persistProfile(patientId, profile, lineUserId);
+    } else {
+      // slot is whitelisted above, so the column name is safe to interpolate.
+      await pool.query(`UPDATE patients SET meal_${slot}=$1 WHERE id=$2`, [time, patientId]);
+    }
 
     // Don't re-send the whole card — the original card's time-pickers and
     // confirm button stay tappable, so re-sending just stacks duplicate cards
@@ -2718,11 +2743,17 @@ async function handlePostback(event) {
     return; // still editing — do not advance
   }
 
-  // 4b. The user confirmed the times → seed defaults if needed and advance.
+  // 4b. The user confirmed the times.
   if (data === 'meal_times_confirmed') {
-    if (!profile.meal_times) profile.meal_times = { ...DEFAULT_MEAL_TIMES };
-    await persistProfile(patientId, profile, lineUserId);
-    await advanceOnboarding(event.replyToken, patient, profile);
+    if (onboarding) {
+      if (!profile.meal_times) profile.meal_times = { ...DEFAULT_MEAL_TIMES };
+      await persistProfile(patientId, profile, lineUserId);
+      await advanceOnboarding(event.replyToken, patient, profile);
+    } else {
+      // Post-onboarding edit — times already written on each pick; just confirm.
+      await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text',
+        text: l === 'en' ? '✅ Your reminder times are updated.' : '✅ อัปเดตเวลาเตือนเรียบร้อยแล้วครับ 😊' }]});
+    }
     return;
   }
 }
@@ -2929,6 +2960,35 @@ async function handleTextMessage(event, patientId) {
   if (intent === 'check_med_list') {
     const card = await buildMedCard(patientId, '💊 รายการยาของคุณ');
     await client.replyMessage({ replyToken: event.replyToken, messages: [card] });
+    await incrementQuota(patientId, 'message');
+    return;
+  }
+
+  // ── change_times (re-open the meal/reminder-time editor) ───
+  if (intent === 'change_times') {
+    const patient = await getOrCreatePatient(lineUserId);
+    const l = lang(patient);
+    if (LIFF_ID) {
+      await client.replyMessage({ replyToken: event.replyToken, messages: [
+        { type: 'text', text: l === 'en'
+          ? 'Sure — tap below to change your reminder times.'
+          : 'ได้เลยครับ กดปุ่มด้านล่างเพื่อเปลี่ยนเวลาเตือนได้เลยครับ 😊' },
+        buildMealLiffButton(l),
+      ]});
+    } else {
+      // No LIFF — fall back to the in-chat editable card seeded from current times.
+      const card = buildMealTimeCard(mealProfileFromPatient(patient), l);
+      card.quickReply = { items: [{
+        type: 'action',
+        action: { type: 'postback', label: S(l, 'meal_confirm_btn'), data: 'meal_times_confirmed', displayText: S(l, 'meal_confirm_btn') },
+      }]};
+      await client.replyMessage({ replyToken: event.replyToken, messages: [
+        { type: 'text', text: l === 'en'
+          ? 'Here are your reminder times — tap edit to change any.'
+          : 'นี่คือเวลาเตือนของคุณครับ กดแก้ไขเพื่อเปลี่ยนได้เลยครับ' },
+        card,
+      ]});
+    }
     await incrementQuota(patientId, 'message');
     return;
   }
@@ -3225,15 +3285,20 @@ if (MEAL_LIFF_HTML) {
       `UPDATE patients SET meal_morning=$1, meal_midday=$2, meal_evening=$3, meal_bedtime=$4 WHERE id=$5`,
       [t.morning, t.midday, t.evening, t.bedtime, patient.id]);
 
-    // Reflect into the in-memory onboarding profile (same process) and, if the
-    // user is still onboarding, push the next question.
+    // Don't make the client wait on LINE push latency.
     if (needsOnboarding(patient)) {
+      // Mid-onboarding: reflect into the in-memory profile and push the next step.
       const profile = await getProfile(patient);
       profile.meal_times = { morning: t.morning, midday: t.midday, evening: t.evening, bedtime: t.bedtime };
       profile._showMealSaved = true;
-      // Don't make the client wait on LINE push latency.
       advanceOnboarding({ to: userId }, patient, profile)
         .catch(err => console.error('Post-LIFF advance failed:', err.message));
+    } else {
+      // Post-onboarding edit ("change my reminder times") — confirm in chat.
+      const l = lang(patient);
+      client.pushMessage({ to: userId, messages: [{ type: 'text',
+        text: S(l, 'meal_times_saved', t.morning, t.midday, t.evening, t.bedtime) }]})
+        .catch(err => console.error('Post-LIFF confirm push failed:', err.message));
     }
     res.json({ ok: true });
   });
