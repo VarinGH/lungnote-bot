@@ -272,7 +272,7 @@ function buildMealTimeCard(profile, l) {
         },
       },
     ],
-    paddingTop: '8px', paddingBottom: '8px',
+    paddingTop: '2px', paddingBottom: '2px',
   }));
 
   return {
@@ -281,17 +281,17 @@ function buildMealTimeCard(profile, l) {
     contents: {
       type: 'bubble', size: 'kilo',
       header: {
-        type: 'box', layout: 'vertical', spacing: 'xs',
+        type: 'box', layout: 'vertical', spacing: 'none',
         contents: [
-          { type: 'text', text: title, weight: 'bold', size: 'md', color: '#ffffff' },
-          { type: 'text', text: S(l, 'meal_card_subtitle'), size: 'xs', color: '#e8f7ee' },
+          { type: 'text', text: title, weight: 'bold', size: 'sm', color: '#ffffff' },
+          { type: 'text', text: S(l, 'meal_card_subtitle'), size: 'xxs', color: '#e8f7ee' },
         ],
-        backgroundColor: '#06C755', paddingAll: '14px',
+        backgroundColor: '#06C755', paddingAll: '10px',
       },
       body: {
         type: 'box', layout: 'vertical',
         contents: rows,
-        paddingAll: '12px', spacing: 'sm',
+        paddingAll: '8px', spacing: 'none',
       },
       footer: {
         type: 'box', layout: 'vertical',
@@ -354,8 +354,8 @@ const S = (lang, key, ...args) => {
       en: '🇹🇭 / 🇬🇧\n\nสวัสดีครับ! ผมลุงโน้ต ผู้ช่วยดูแลสุขภาพบน LINE ครับ 😊\nHi! I\'m Uncle Note, your personal health assistant on LINE.\n\nกรุณาเลือกภาษา / Please choose your language:',
     },
     ask_name: {
-      th: 'สวัสดีครับ ผมลุงโน้ต ผู้ช่วยดูแลสุขภาพครับ 😊\nขอทราบชื่อของคุณด้วยได้ไหมครับ?',
-      en: 'Nice to meet you! 😊\nWhat\'s your name?',
+      th: 'ยินดีที่ได้ดูแลครับ 😊 ลุงช่วยได้ 3 อย่างนี้ครับ\n⏰ เตือนเวลาทานยา\n📊 บันทึกค่าความดัน/น้ำตาล\n👨‍👩‍👧 แจ้งลูกหลานเมื่อมีเรื่องสำคัญ\n\nก่อนอื่น ขอทราบชื่อของคุณหน่อยได้ไหมครับ?',
+      en: 'Glad to be looking after you! 😊 I can help with 3 things:\n⏰ Medication reminders\n📊 Logging your blood pressure / sugar\n👨‍👩‍👧 Notifying your family when something matters\n\nFirst, may I have your name?',
     },
     name_retry: {
       th: 'ขอโทษครับ ลุงยังไม่ได้ยินชื่อ ช่วยพิมพ์ชื่อมาอีกครั้งได้ไหมครับ?',
@@ -462,6 +462,24 @@ const S = (lang, key, ...args) => {
       th: 'พิมพ์ชื่อยามาได้เลยครับ เช่น "Amlodipine 5mg"\nลุงจะถามเวลากินให้ครับ 💊',
       en: 'Type the medication name, e.g. "Amlodipine 5mg"\nI\'ll ask when you take it 💊',
     },
+    ask_med_dose: {
+      th: (name) => `${name} — ทานครั้งละกี่เม็ดครับ?`,
+      en: (name) => `${name} — how many do you take each time?`,
+    },
+    dose_buttons: {
+      th: [
+        { label: '½ เม็ด', text: 'ครึ่งเม็ด' },
+        { label: '1 เม็ด', text: '1 เม็ด' },
+        { label: '2 เม็ด', text: '2 เม็ด' },
+        { label: '🤔 ไม่แน่ใจ', text: 'ไม่แน่ใจ' },
+      ],
+      en: [
+        { label: '½ tablet', text: 'half tablet' },
+        { label: '1 tablet', text: '1 tablet' },
+        { label: '2 tablets', text: '2 tablets' },
+        { label: '🤔 Not sure', text: 'not sure' },
+      ],
+    },
     ask_med_time: {
       th: (name, dosage) => `${name}${dosage ? ` ${dosage}` : ''} — ทานตอนไหนครับ?`,
       en: (name, dosage) => `${name}${dosage ? ` ${dosage}` : ''} — when do you take it?`,
@@ -519,12 +537,12 @@ const S = (lang, key, ...args) => {
       en: 'Sorry, I didn\'t understand — does everything look correct?',
     },
     complete_solo: {
-      th: (name, count) => `เยี่ยมเลยครับ คุณ${name || ''} 🎉\nจดยาไว้ ${count} ตัวแล้วครับ ลุงจะเตือนยาตรงเวลาให้นะครับ ⏰\nบอกค่าความดัน น้ำตาล หรืออาการมาได้เลยครับ`,
-      en: (name, count) => `All set, ${name || ''}! 🎉\nI've saved ${count} medication(s) and will remind you on time ⏰\nFeel free to log your BP, blood sugar, or any symptoms anytime!`,
+      th: (name, count) => `เยี่ยมเลยครับ คุณ${name || ''} 🎉\nจดยาไว้ ${count} ตัวแล้ว ลุงจะเตือนทานยาตรงเวลาให้นะครับ ⏰\nดูสรุปสุขภาพและดาวน์โหลดรายงาน (PDF) ไปให้คุณหมอได้จากเมนูแดชบอร์ดด้านล่างเลยครับ 📊`,
+      en: (name, count) => `All set, ${name || ''}! 🎉\nI've saved ${count} medication(s) and will remind you on time ⏰\nYou can view your health summary and export a report (PDF) for your doctor from the dashboard menu below 📊`,
     },
     complete_no_meds: {
-      th: (name) => `เรียบร้อยครับ คุณ${name || ''} 🎉\nลุงโน้ตพร้อมดูแลแล้วครับ! บอกค่าความดัน น้ำตาล หรืออาการมาได้เลยนะครับ`,
-      en: (name) => `All set, ${name || ''}! 🎉\nUncle Note is ready. Feel free to log your BP, blood sugar, or any symptoms!`,
+      th: (name) => `เรียบร้อยครับ คุณ${name || ''} 🎉\nลุงพร้อมดูแลแล้วครับ ดูสรุปสุขภาพและดาวน์โหลดรายงาน (PDF) ไปให้คุณหมอได้จากเมนูแดชบอร์ดด้านล่างเลยครับ 📊`,
+      en: (name) => `All set, ${name || ''}! 🎉\nUncle Note is ready. You can view your health summary and export a report (PDF) for your doctor from the dashboard menu below 📊`,
     },
     guardian_complete: {
       th: (name) => `เยี่ยมเลยครับ 🎉 ตั้งค่าเสร็จแล้ว!\nลุงสร้างลิงก์เชิญคุณ${name || 'ท่าน'}ให้แล้วครับ\nส่งลิงก์นี้ให้ท่านกดเพื่อเริ่มใช้งานได้เลยครับ:`,
@@ -719,7 +737,16 @@ async function getProfile(patient) {
       };
     }
     if (patient.pending_med_name) {
-      p.pending_med = { name: patient.pending_med_name, dosage: patient.pending_med_dosage || null };
+      // We can't recover which sub-stage we were in across a restart; resume at
+      // the time question (skip re-asking the dose) since dosage is already saved.
+      p.pending_med = {
+        name: patient.pending_med_name,
+        dosageMg: patient.pending_med_dosage || null,
+        dosage: patient.pending_med_dosage || null,
+        schedule: [],
+        timeGiven: false,
+        stage: 'time',
+      };
     }
   }
 
@@ -847,6 +874,13 @@ function deterministicOnboardingInfo(text, step) {
   if (step === 'medications') {
     if (t === 'ไม่มียา' || t === 'no medications') return { no_medications: true };
     if (t === 'ถ่ายรูปยา' || t === 'photo') return { wants_photo: true };
+    if (t === 'มียา' || t === 'yes medications') return { wants_to_add_meds: true };
+  }
+
+  if (step === 'med_dose') {
+    if (t === 'ไม่แน่ใจ' || t === 'ไม่ทราบ' || t === 'not sure') return { dose_answered: true };
+    const DOSE_TEXTS = new Set(['ครึ่งเม็ด', '1 เม็ด', '2 เม็ด', 'half tablet', '1 tablet', '2 tablets']);
+    if (DOSE_TEXTS.has(t)) return { dose_count: t };
   }
 
   if (step === 'med_time' && TIME_BUTTON_SCHEDULES[t]) {
@@ -945,7 +979,8 @@ function nextStep(profile, medCount = null) {
   if (profile.care_mode === 'family' && !profile.patient_name) return 'patient_name';
   if (profile.conditions === null) return 'conditions';
   if (!profile.meal_times) return 'meal_times';
-  if (profile.pending_med) return 'med_time';      // a named med is waiting for its time
+  // A named med is waiting: first for its dose (tablets), then for its time.
+  if (profile.pending_med) return profile.pending_med.stage === 'dosage' ? 'med_dose' : 'med_time';
   if (!profile.meds_done) return 'medications';
   // If they finished with zero meds, there's nothing to confirm → complete.
   if (medCount === 0) return 'complete';
@@ -1015,23 +1050,25 @@ async function handleOnboarding(event, patient) {
 
   // Language is special-cased with a cheap deterministic check first
   // (the buttons send exact strings), falling back to the extractor.
+  let justPickedLanguage = false;
   if (!profile.language) {
     const isEn = /english|^en$/i.test(text) || text === 'English';
     const isTh = /ไทย|thai/i.test(text) || text === 'ภาษาไทย';
     if (isEn || isTh) {
       profile.language = isEn ? 'en' : 'th';
+      justPickedLanguage = true;
     }
   }
 
   const step = nextStep(profile);
 
-  // Run the extractor for everything except the pure language pick
-  // (which we may have just resolved above). The extractor is also how
-  // we handle med names, done/confirm/edit signals, etc.
-  // Quick-reply buttons send fixed, known strings — resolve those without an LLM
-  // round-trip. Only free-form text falls through to the (slower) extractor.
+  // Run the extractor for everything except the pure language pick. When the user
+  // JUST picked the language this turn, the whole message was that pick — there's
+  // nothing else to extract, so skip the LLM entirely and reply instantly with the
+  // next question. Quick-reply buttons elsewhere send fixed, known strings — resolve
+  // those deterministically; only free-form text falls through to the (slower) extractor.
   let info = {};
-  if (profile.language && step !== 'language') {
+  if (profile.language && step !== 'language' && !justPickedLanguage) {
     info = deterministicOnboardingInfo(text, step) || await extractOnboardingInfo(text, profile, step);
   }
 
@@ -1062,16 +1099,58 @@ async function handleOnboarding(event, patient) {
     }
   }
 
-  // (B) A medication name was provided — save it (or ask its time).
-  //     Medication parsing now comes from the LLM extractor (info.medication
-  //     and info.schedule_reply), so it works the same in Thai and English
-  //     and across natural phrasings ("twice a day", "after breakfast", ...).
+  // (B0) We asked how many tablets per dose for the pending med — this reply is it.
+  if (step === 'med_dose' && profile.pending_med) {
+    if (info.done_listing_meds || info.no_medications || info.wants_edit || info.confirms_correct) {
+      // User bailed on this med before giving a dose — drop it, fall through.
+      profile.pending_med = null;
+      await pool.query(`UPDATE patients SET pending_med_name=NULL, pending_med_dosage=NULL WHERE id=$1`, [patientId]);
+    } else {
+      // Resolve tablets-per-dose: button → info.dose_count; "not sure" → none;
+      // otherwise a short free-typed answer ("2", "ครึ่งเม็ด"). Ignore anything that
+      // looks like a new drug name so we don't store it as a dose.
+      let tablets = null;
+      if (typeof info.dose_count === 'string') tablets = info.dose_count;
+      else if (!info.dose_answered && !info.looks_like_medication &&
+               text.trim().length > 0 && text.trim().length <= 20) tablets = text.trim();
+      const pm = profile.pending_med;
+      pm.dosage = [pm.dosageMg, tablets].filter(Boolean).join(' · ') || null;
+      pm.stage = 'time';
+      await pool.query(`UPDATE patients SET pending_med_dosage=$1 WHERE id=$2`, [pm.dosage, patientId]);
+      if (pm.timeGiven && pm.schedule.length > 0) {
+        // Time was already given with the name → nothing left to ask, save now.
+        const med = await saveMedicationToDB(patientId, pm.name, pm.dosage, pm.schedule);
+        profile.pending_med = null;
+        await pool.query(`UPDATE patients SET pending_med_name=NULL, pending_med_dosage=NULL WHERE id=$1`, [patientId]);
+        await client.replyMessage({ replyToken, messages: [{ type: 'text',
+          text: S(l, 'med_saved', formatMed(med)) + (l === 'en' ? 'Any others? Or say "all done".' : 'มีอีกไหมครับ? หรือพิมพ์ "หมดแล้ว" ครับ') }]});
+        return;
+      }
+      await client.replyMessage({ replyToken, messages: [buildQuickReply(
+        S(l, 'ask_med_time', pm.name, pm.dosage),
+        l === 'en' ? TIME_BUTTONS_EN : TIME_BUTTONS
+      )]});
+      return;
+    }
+  }
+
+  // (B1) User said they have meds and want to type them ("มียา" button) → prompt
+  //      for the name. Without this, tapping it produced no state change and the
+  //      bot re-asked the same yes/no question on a loop.
+  if (step === 'medications' && info.wants_to_add_meds &&
+      !info.looks_like_medication && !profile.meds_done) {
+    await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'ask_med_name') }]});
+    return;
+  }
+
+  // (B) A medication name (new) or a time reply (for a pending med).
+  //     Medication parsing comes from the LLM extractor (info.medication and
+  //     info.schedule_reply), so it works the same in Thai and English.
   if ((step === 'medications' || step === 'med_time') &&
       (info.looks_like_medication || step === 'med_time')) {
-    // If we were waiting for a time for a pending med, this message is the time
-    // — UNLESS the user is actually signalling they're done / want to edit, in
-    // which case we must not swallow it as a schedule. Drop the pending med
-    // (it was never given a time) and fall through to the done/edit handling.
+    // If we were waiting for a TIME for a pending med, this message is the time —
+    // UNLESS the user is signalling done/edit, in which case drop the pending med
+    // (never given a time) and fall through to the done/edit handling.
     if (step === 'med_time' && profile.pending_med) {
       if (info.done_listing_meds || info.no_medications || info.wants_edit || info.confirms_correct) {
         profile.pending_med = null;
@@ -1095,34 +1174,23 @@ async function handleOnboarding(event, patient) {
         return;
       }
     }
-    // Otherwise this is a new med name in the listing phase.
+    // Otherwise this is a new med name in the listing phase → ask its dose first.
     if (info.looks_like_medication) {
       const med0 = medFromExtraction(info);
       if (!med0) {
         await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'med_name_unclear') }]});
         return;
       }
-      if (!med0.timeGiven) {
-        // Need a time — stash as pending and ask, with quick-reply buttons.
-        profile.pending_med = { name: med0.name, dosage: med0.dosage };
-        await pool.query(`UPDATE patients SET pending_med_name=$1, pending_med_dosage=$2 WHERE id=$3`, [med0.name, med0.dosage, patientId]);
-        await client.replyMessage({ replyToken, messages: [buildQuickReply(
-          S(l, 'ask_med_time', med0.name, med0.dosage),
-          l === 'en' ? TIME_BUTTONS_EN : TIME_BUTTONS
-        )]});
-        return;
-      }
-      const med = await saveMedicationToDB(patientId, med0.name, med0.dosage, med0.schedule);
-      await client.replyMessage({ replyToken, messages: [{ type: 'text',
-        text: S(l, 'med_saved', formatMed(med)) + (l === 'en' ? 'Any others? Or say "all done".' : 'มีอีกไหมครับ? หรือพิมพ์ "หมดแล้ว" ครับ') }]});
+      await startPendingMed(replyToken, patientId, profile, l, med0);
       return;
     }
   }
 
-  // From here on, treat 'medications' and 'med_time' as the same "meds area":
-  // a done/no-meds/photo signal can arrive even while a med was pending (we
-  // dropped that pending med just above), so both steps should honour them.
-  const inMedsArea = (step === 'medications' || step === 'med_time');
+  // From here on, treat 'medications', 'med_dose' and 'med_time' as the same
+  // "meds area": a done/no-meds/photo signal can arrive even while a med was
+  // pending its dose or time (we dropped that pending med just above), so all
+  // three steps should honour them.
+  const inMedsArea = (step === 'medications' || step === 'med_dose' || step === 'med_time');
 
   // (C) No-medications declaration during the meds phase.
   if (inMedsArea && info.no_medications) {
@@ -1152,21 +1220,13 @@ async function handleOnboarding(event, patient) {
       await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'edit_meds') }]});
       return;
     } else if (info.looks_like_medication) {
-      // They typed another med at the confirm screen — treat as an addition.
+      // They typed another med at the confirm screen — treat as an addition,
+      // routed through the same dose-then-time flow as the listing phase.
       profile.meds_done = false;
       profile.confirmed = null;
       const med0 = medFromExtraction(info);
       if (med0) {
-        if (!med0.timeGiven) {
-          profile.pending_med = { name: med0.name, dosage: med0.dosage };
-          await pool.query(`UPDATE patients SET pending_med_name=$1, pending_med_dosage=$2 WHERE id=$3`, [med0.name, med0.dosage, patientId]);
-          await client.replyMessage({ replyToken, messages: [buildQuickReply(
-            S(l, 'ask_med_time', med0.name, med0.dosage), l === 'en' ? TIME_BUTTONS_EN : TIME_BUTTONS)]});
-          return;
-        }
-        const med = await saveMedicationToDB(patientId, med0.name, med0.dosage, med0.schedule);
-        await client.replyMessage({ replyToken, messages: [{ type: 'text',
-          text: S(l, 'med_saved', formatMed(med)) + (l === 'en' ? 'Any others? Or say "all done".' : 'มีอีกไหมครับ? หรือพิมพ์ "หมดแล้ว" ครับ') }]});
+        await startPendingMed(replyToken, patientId, profile, l, med0);
         return;
       }
     }
@@ -1182,6 +1242,26 @@ async function handleOnboarding(event, patient) {
 
   // ===== Decide & ask the next thing =====
   await advanceOnboarding(replyToken, patient, profile);
+}
+
+// Stash a freshly-named medication as pending and ask how many tablets per dose.
+// Shared by the meds-listing flow, the confirm-screen "add another" path, and the
+// photo-label path so all three collect a dose (tablets) before asking the time.
+async function startPendingMed(replyToken, patientId, profile, l, med0) {
+  profile.pending_med = {
+    name: med0.name,
+    dosageMg: med0.dosage || null,   // strength from the name, e.g. "5mg" (may be null)
+    dosage: med0.dosage || null,     // running display value; tablets get appended next turn
+    schedule: med0.schedule || [],
+    timeGiven: !!med0.timeGiven,
+    stage: 'dosage',
+  };
+  await pool.query(`UPDATE patients SET pending_med_name=$1, pending_med_dosage=$2 WHERE id=$3`,
+    [med0.name, med0.dosage || null, patientId]);
+  await client.replyMessage({ replyToken, messages: [buildQuickReply(
+    S(l, 'ask_med_dose', med0.name),
+    S(l, 'dose_buttons')
+  )]});
 }
 
 // ------------------------------------------------------------
@@ -1244,12 +1324,26 @@ async function advanceOnboarding(replyToken, patient, profile) {
 
     case 'meal_times': {
       const card = buildMealTimeCard(profile, l);
+      // Attaching a quick-reply to the last message makes LINE collapse the soft
+      // keyboard (and show chips instead), so the tall card isn't hidden behind it.
+      card.quickReply = { items: [{
+        type: 'action',
+        action: { type: 'postback', label: S(l, 'meal_confirm_btn'), data: 'meal_times_confirmed', displayText: S(l, 'meal_confirm_btn') },
+      }]};
       await client.replyMessage({ replyToken, messages: [
         { type: 'text', text: S(l, 'meal_card_intro') },
         card,
       ]});
       return;
     }
+
+    case 'med_dose':
+      // A med is pending its dose but we returned here without asking; ask now.
+      await client.replyMessage({ replyToken, messages: [buildQuickReply(
+        S(l, 'ask_med_dose', profile.pending_med.name),
+        S(l, 'dose_buttons')
+      )]});
+      return;
 
     case 'med_time':
       // We have a pending med but somehow returned here without asking; ask now.
@@ -1372,14 +1466,18 @@ async function handleImageDuringOnboarding(event, patient) {
       await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: S(l, 'photo_ask_retake') }]});
       return;
     }
-    // Stash as a pending med awaiting its time, then ask the time.
-    profile.pending_med = { name, dosage: dosage || null };
+    // Stash as a pending med and ask the dose (then the time) — same flow as text.
+    profile.pending_med = {
+      name, dosageMg: dosage || null, dosage: dosage || null,
+      schedule: [], timeGiven: false, stage: 'dosage',
+    };
     profile.meds_done = false;
     profile.confirmed = null;
     await pool.query(`UPDATE patients SET pending_med_name=$1, pending_med_dosage=$2 WHERE id=$3`, [name, dosage || null, patientId]);
+    const photoAck = l === 'en' ? 'Got it 📷 ' : 'อ่านได้ครับ 📷 ';
     await client.replyMessage({ replyToken: event.replyToken, messages: [buildQuickReply(
-      S(l, 'photo_read', name, dosage),
-      l === 'en' ? TIME_BUTTONS_EN : TIME_BUTTONS
+      photoAck + S(l, 'ask_med_dose', name + (dosage ? ` ${dosage}` : '')),
+      S(l, 'dose_buttons')
     )]});
   } catch (err) {
     console.error('Image onboarding error:', err.message);
