@@ -5,6 +5,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import pg from 'pg';
 import cron from 'node-cron';
 import crypto from 'crypto';
+import { readFileSync } from 'fs';
 
 const { Pool } = pg;
 
@@ -32,6 +33,10 @@ const blobClient = new line.messagingApi.MessagingApiBlobClient({
 });
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const app = express();
+
+// LIFF mini-app for setting meal/medication times (elderly-friendly, one screen).
+// When LIFF_ID is unset we fall back to the in-chat datetimepicker Flex card.
+const LIFF_ID = process.env.LIFF_ID || '';
 
 // ============================================================
 // SYSTEM PROMPT
@@ -239,6 +244,31 @@ async function buildMedCard(patientId, headerText = '💊 รายการย�
 // Default meal/medication times used when a slot is missing.
 const DEFAULT_MEAL_TIMES = { morning: '08:00', midday: '12:00', evening: '18:00', bedtime: '21:00' };
 
+// buildMealLiffButton: a simple card whose button opens the LIFF mini-app where
+// the user sets all four times on one big, elderly-friendly screen. Used in
+// place of the in-chat datetimepicker card when LIFF_ID is configured.
+function buildMealLiffButton(l) {
+  const url = `https://liff.line.me/${LIFF_ID}?lang=${l}`;
+  return {
+    type: 'flex',
+    altText: S(l, 'meal_open_btn'),
+    contents: {
+      type: 'bubble', size: 'kilo',
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '16px',
+        contents: [
+          { type: 'text', text: l === 'en' ? '⏰ Meal & medicine times' : '⏰ เวลาทานข้าวและทานยา', weight: 'bold', size: 'lg', wrap: true, color: '#1a1a1a' },
+          { type: 'text', text: l === 'en' ? 'Tap to set all 4 times on one screen — big, easy buttons.' : 'กดปุ่มเพื่อตั้งเวลาทั้ง 4 มื้อในหน้าเดียว ปุ่มใหญ่ กดง่ายครับ', size: 'sm', wrap: true, color: '#666666' },
+          {
+            type: 'button', style: 'primary', color: '#06C755', height: 'md', margin: 'md',
+            action: { type: 'uri', label: S(l, 'meal_open_btn'), uri: url },
+          },
+        ],
+      },
+    },
+  };
+}
+
 // buildMealTimeCard: interactive Flex card shown during the meal_times
 // onboarding step. Each row has a datetimepicker edit button; the footer
 // confirm button posts back 'meal_times_confirmed'. Mirrors buildMedCard.
@@ -428,6 +458,7 @@ const S = (lang, key, ...args) => {
     meal_slot_bedtime: { th: 'ก่อนนอน', en: 'Bedtime' },
     meal_edit_btn: { th: 'แก้ไข', en: 'Edit' },
     meal_confirm_btn: { th: '✓ ใช้เวลานี้เลย', en: '✓ Use these times' },
+    meal_open_btn: { th: '⏰ ตั้งเวลามื้ออาหาร', en: '⏰ Set meal times' },
     meal_edited: {
       th: (slotLabel, time) => `แก้ให้แล้วครับ ${slotLabel} เปลี่ยนเป็น ${time} ครับ`,
       en: (slotLabel, time) => `Updated — ${slotLabel} changed to ${time}`,
@@ -1283,10 +1314,16 @@ async function startPendingMed(replyToken, patientId, profile, l, med0) {
 // or finish. Centralises the "what do we say now" logic so both text and
 // photo handlers can call it.
 // ------------------------------------------------------------
-async function advanceOnboarding(replyToken, patient, profile) {
+async function advanceOnboarding(target, patient, profile) {
   const patientId = patient.id;
   const lineUserId = patient.line_user_id || (profile._lineUserId);
   const l = profile.language || 'th';
+
+  // `target` is normally a replyToken string (webhook reply). The LIFF save
+  // endpoint has no replyToken, so it passes { to: lineUserId } to push instead.
+  const respond = (messages) => typeof target === 'string'
+    ? client.replyMessage({ replyToken: target, messages })
+    : client.pushMessage({ to: target.to, messages });
 
   // If meds are done, we need the count to decide confirm vs. complete.
   let medCount = null;
@@ -1305,38 +1342,47 @@ async function advanceOnboarding(replyToken, patient, profile) {
 
   switch (step) {
     case 'language':
-      await client.replyMessage({ replyToken, messages: [buildQuickReply(
+      await respond([buildQuickReply(
         S('th', 'welcome_ask_lang'),
         [{ label: '🇹🇭 ภาษาไทย', text: 'ภาษาไทย' }, { label: '🇬🇧 English', text: 'English' }]
-      )]});
+      )]);
       return;
 
     case 'self_name':
-      await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'ask_name') }]});
+      await respond([{ type: 'text', text: S(l, 'ask_name') }]);
       return;
 
     case 'care_mode':
-      await client.replyMessage({ replyToken, messages: [buildQuickReply(
+      await respond([buildQuickReply(
         S(l, 'ask_mode', profile.self_name || ''),
         S(l, 'mode_buttons')
-      )]});
+      )]);
       return;
 
     case 'patient_name':
-      await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'family_intro') }]});
+      await respond([{ type: 'text', text: S(l, 'family_intro') }]);
       return;
 
     case 'conditions': {
       const askKey = profile.care_mode === 'family' ? 'ask_conditions_for' : 'ask_conditions';
       const askArg = profile.care_mode === 'family' ? (profile.patient_name || '') : undefined;
-      await client.replyMessage({ replyToken, messages: [buildQuickReply(
+      await respond([buildQuickReply(
         askArg !== undefined ? S(l, askKey, askArg) : S(l, askKey),
         S(l, 'condition_buttons')
-      )]});
+      )]);
       return;
     }
 
     case 'meal_times': {
+      // Preferred path: open the LIFF mini-app (one big screen, set + save).
+      if (LIFF_ID) {
+        await respond([
+          { type: 'text', text: S(l, 'meal_card_intro') },
+          buildMealLiffButton(l),
+        ]);
+        return;
+      }
+      // Fallback (no LIFF configured): the in-chat datetimepicker card.
       const card = buildMealTimeCard(profile, l);
       // Attaching a quick-reply to the last message makes LINE collapse the soft
       // keyboard (and show chips instead), so the tall card isn't hidden behind it.
@@ -1344,27 +1390,27 @@ async function advanceOnboarding(replyToken, patient, profile) {
         type: 'action',
         action: { type: 'postback', label: S(l, 'meal_confirm_btn'), data: 'meal_times_confirmed', displayText: S(l, 'meal_confirm_btn') },
       }]};
-      await client.replyMessage({ replyToken, messages: [
+      await respond([
         { type: 'text', text: S(l, 'meal_card_intro') },
         card,
-      ]});
+      ]);
       return;
     }
 
     case 'med_dose':
       // A med is pending its dose but we returned here without asking; ask now.
-      await client.replyMessage({ replyToken, messages: [buildQuickReply(
+      await respond([buildQuickReply(
         S(l, 'ask_med_dose', profile.pending_med.name),
         S(l, 'dose_buttons')
-      )]});
+      )]);
       return;
 
     case 'med_time':
       // We have a pending med but somehow returned here without asking; ask now.
-      await client.replyMessage({ replyToken, messages: [buildQuickReply(
+      await respond([buildQuickReply(
         S(l, 'ask_med_time', profile.pending_med.name, profile.pending_med.dosage),
         l === 'en' ? TIME_BUTTONS_EN : TIME_BUTTONS
-      )]});
+      )]);
       return;
 
     case 'medications': {
@@ -1377,7 +1423,7 @@ async function advanceOnboarding(replyToken, patient, profile) {
         profile._showMealSaved = false;
       }
       msgs.push(buildQuickReply(S(l, askKey), S(l, 'med_buttons')));
-      await client.replyMessage({ replyToken, messages: msgs });
+      await respond(msgs);
       return;
     }
 
@@ -1388,15 +1434,15 @@ async function advanceOnboarding(replyToken, patient, profile) {
         : (l === 'en' ? '💊 Your medications' : '💊 รายการยาที่ลุงจดไว้');
       const card = await buildMedCard(patientId, header);
       const nameForConfirm = profile.care_mode === 'family' ? (profile.patient_name || '') : (profile.self_name || '');
-      await client.replyMessage({ replyToken, messages: [
+      await respond([
         card,
         buildQuickReply(S(l, 'ask_confirm', nameForConfirm), S(l, 'confirm_buttons')),
-      ]});
+      ]);
       return;
     }
 
     case 'complete':
-      await finishOnboarding(replyToken, patient, profile);
+      await finishOnboarding(target, patient, profile);
       return;
   }
 }
@@ -1405,10 +1451,13 @@ async function advanceOnboarding(replyToken, patient, profile) {
 // finishOnboarding: mark complete and send the right closing message.
 // Self mode → friendly wrap-up. Family mode → create + send invite link.
 // ------------------------------------------------------------
-async function finishOnboarding(replyToken, patient, profile) {
+async function finishOnboarding(target, patient, profile) {
   const patientId = patient.id;
   const lineUserId = patient.line_user_id || profile._lineUserId;
   const l = profile.language || 'th';
+  const respond = (messages) => typeof target === 'string'
+    ? client.replyMessage({ replyToken: target, messages })
+    : client.pushMessage({ to: target.to, messages });
   await setOnboardingState(patientId, 'complete');
   clearProfile(patientId);
   medCache.delete(patientId);
@@ -1418,13 +1467,13 @@ async function finishOnboarding(replyToken, patient, profile) {
     try {
       const { deepLink } = await createInviteLink(lineUserId, patientName);
       const card = buildInviteCard(deepLink, patientName);
-      await client.replyMessage({ replyToken, messages: [
+      await respond([
         { type: 'text', text: S(l, 'guardian_complete', patientName) },
         card,
-      ]});
+      ]);
     } catch (err) {
       console.error('Invite link creation failed at onboarding finish:', err.message);
-      await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, 'guardian_complete_fallback', patientName) }]});
+      await respond([{ type: 'text', text: S(l, 'guardian_complete_fallback', patientName) }]);
     }
     return;
   }
@@ -1436,7 +1485,7 @@ async function finishOnboarding(replyToken, patient, profile) {
   const msg = count > 0
     ? S(l, 'complete_solo', profile.self_name || '', count)
     : S(l, 'complete_no_meds', profile.self_name || '');
-  await client.replyMessage({ replyToken, messages: [{ type: 'text', text: msg }]});
+  await respond([{ type: 'text', text: msg }]);
 }
 
 // ============================================================
@@ -3103,6 +3152,91 @@ async function handleImageMessage(event, patientId) {
     await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text',
       text: 'ขอโทษครับ ลุงอ่านรูปไม่ค่อยออก ช่วยถ่ายใหม่ให้ชัด ๆ อีกครั้งได้ไหมครับ?' }]});
   }
+}
+
+// ============================================================
+// LIFF MINI-APP — meal/medication times (elderly-friendly, one screen)
+// ============================================================
+
+// Load the page once and bake in the LIFF ID (env is static at boot). If the
+// file is missing we just skip the routes — the bot falls back to the in-chat
+// datetimepicker card automatically (LIFF_ID gating in advanceOnboarding).
+let MEAL_LIFF_HTML = null;
+try {
+  MEAL_LIFF_HTML = readFileSync(new URL('./public/meal-times.html', import.meta.url), 'utf8')
+    .replace(/__LIFF_ID__/g, LIFF_ID);
+} catch (err) {
+  console.warn('⚠️  public/meal-times.html not found — LIFF meal editor disabled:', err.message);
+}
+
+// Verify a LIFF access token by calling LINE's profile API. Returns the
+// verified LINE userId (cannot be spoofed by the client) or null.
+async function verifyLiffToken(accessToken) {
+  if (!accessToken) return null;
+  try {
+    const r = await fetch('https://api.line.me/v2/profile', {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!r.ok) return null;
+    const profile = await r.json();
+    return profile.userId || null;
+  } catch (err) {
+    console.error('LIFF token verification failed:', err.message);
+    return null;
+  }
+}
+
+const isHHMM = (s) => typeof s === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(s);
+
+if (MEAL_LIFF_HTML) {
+  // Serve the mini-app page.
+  app.get('/meal-times', (_req, res) => res.type('html').send(MEAL_LIFF_HTML));
+
+  // Load the user's current times so the inputs open pre-filled.
+  app.get('/api/meal-times', async (req, res) => {
+    const userId = await verifyLiffToken((req.headers.authorization || '').replace(/^Bearer\s+/i, ''));
+    if (!userId) return res.status(401).json({ error: 'unauthorized' });
+    const r = await pool.query(
+      `SELECT meal_morning, meal_midday, meal_evening, meal_bedtime
+         FROM patients WHERE line_user_id=$1`, [userId]);
+    const row = r.rows[0] || {};
+    res.json({
+      morning: String(row.meal_morning || DEFAULT_MEAL_TIMES.morning).slice(0, 5),
+      midday:  String(row.meal_midday  || DEFAULT_MEAL_TIMES.midday).slice(0, 5),
+      evening: String(row.meal_evening || DEFAULT_MEAL_TIMES.evening).slice(0, 5),
+      bedtime: String(row.meal_bedtime || DEFAULT_MEAL_TIMES.bedtime).slice(0, 5),
+    });
+  });
+
+  // Save the four times. During onboarding this also advances the chat (push)
+  // to the next step, so closing the mini-app drops the user straight into the
+  // meds question — no extra tap needed.
+  app.post('/api/meal-times', express.json(), async (req, res) => {
+    const userId = await verifyLiffToken((req.headers.authorization || '').replace(/^Bearer\s+/i, ''));
+    if (!userId) return res.status(401).json({ error: 'unauthorized' });
+
+    const t = req.body?.times || {};
+    if (!isHHMM(t.morning) || !isHHMM(t.midday) || !isHHMM(t.evening) || !isHHMM(t.bedtime)) {
+      return res.status(400).json({ error: 'invalid_times' });
+    }
+
+    const patient = await getOrCreatePatient(userId);
+    await pool.query(
+      `UPDATE patients SET meal_morning=$1, meal_midday=$2, meal_evening=$3, meal_bedtime=$4 WHERE id=$5`,
+      [t.morning, t.midday, t.evening, t.bedtime, patient.id]);
+
+    // Reflect into the in-memory onboarding profile (same process) and, if the
+    // user is still onboarding, push the next question.
+    if (needsOnboarding(patient)) {
+      const profile = await getProfile(patient);
+      profile.meal_times = { morning: t.morning, midday: t.midday, evening: t.evening, bedtime: t.bedtime };
+      profile._showMealSaved = true;
+      // Don't make the client wait on LINE push latency.
+      advanceOnboarding({ to: userId }, patient, profile)
+        .catch(err => console.error('Post-LIFF advance failed:', err.message));
+    }
+    res.json({ ok: true });
+  });
 }
 
 // ============================================================
