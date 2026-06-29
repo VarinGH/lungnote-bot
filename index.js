@@ -162,6 +162,20 @@ Message: "${text}"` }],
   }
 }
 
+// Normalize a meal_times object returned inline by the onboarding extractor
+// (same output shape as parseMealTimes). Fills any missing/invalid slot with the
+// default so the rest of the flow always sees four valid times. Returns null for
+// a non-object so callers can fall back to the dedicated parseMealTimes() call.
+function normalizeMealTimes(mt) {
+  if (!mt || typeof mt !== 'object') return null;
+  return {
+    morning: formatTime(mt.morning) || MEAL_DEFAULTS.morning,
+    midday:  formatTime(mt.midday)  || MEAL_DEFAULTS.midday,
+    evening: formatTime(mt.evening) || MEAL_DEFAULTS.evening,
+    bedtime: formatTime(mt.bedtime) || MEAL_DEFAULTS.bedtime,
+  };
+}
+
 function formatMed(med) {
   const times = med.schedule.map(t => TIME_LABELS[t] || t).join(', ');
   return `${med.name}${med.dosage ? ` ${med.dosage}` : ''} — ${times}`;
@@ -724,27 +738,17 @@ function clearProfile(patientId) {
 // medication data (name/dose/schedule), validated downstream by
 // normalizeSchedule/medFromExtraction before anything is saved.
 // ------------------------------------------------------------
-async function extractOnboardingInfo(text, profile, step) {
-  const known = {
-    language: profile.language,
-    care_mode: profile.care_mode,
-    self_name: profile.self_name,
-    patient_name: profile.patient_name,
-    conditions: profile.conditions,
-    meal_times_known: !!profile.meal_times,
-    waiting_for: step,
-  };
-
-  const prompt = `You are the onboarding extractor for a Thai elderly-health LINE assistant ("ลุงโน้ต").
+// Static instruction block for the onboarding extractor. Kept at module scope and
+// sent as a CACHED system prompt (cache_control below) so the large rule-set isn't
+// re-processed on every onboarding turn — only the small per-message context varies.
+// NOTE: prompt caching has a per-model minimum cacheable size (~2048 tokens for
+// Haiku); if this block is under that floor the cache is silently skipped, but the
+// static/dynamic split is still correct and engages automatically if it grows.
+const ONBOARDING_EXTRACTOR_SYSTEM = `You are the onboarding extractor for a Thai elderly-health LINE assistant ("ลุงโน้ต").
 A user is being onboarded. Read their latest message and pull out any information relevant to the fields below.
 Do NOT guess or invent. Only fill a field if the message clearly provides it. Leave everything else null.
 
-What we already know (for context — do not repeat unless the user is changing it):
-${JSON.stringify(known, null, 2)}
-
-We are currently waiting for: "${step}"
-
-User's latest message: "${text}"
+The user's message and the context of what we already know will be provided in the next message.
 
 Reply with ONLY this JSON (no prose, no markdown):
 {
@@ -754,6 +758,12 @@ Reply with ONLY this JSON (no prose, no markdown):
   "patient_name": string | null,              // name of the person they care for (family mode)
   "conditions": string | null,                // medical conditions, or "none" if they say they have none
   "mentions_meal_times": boolean,             // true if message describes meal/medication times of day
+  "meal_times": {                              // present ONLY when mentions_meal_times is true; exact clock times
+    "morning": "HH:MM" | null,
+    "midday":  "HH:MM" | null,
+    "evening": "HH:MM" | null,
+    "bedtime": "HH:MM" | null
+  } | null,
   "wants_photo": boolean,                      // true if they want to send a photo of a medicine label
   "no_medications": boolean,                   // true if they clearly have NO regular medications
   "done_listing_meds": boolean,                // true if they signal they've finished listing medications
@@ -785,6 +795,12 @@ Map natural phrases to the nearest anchor. Examples:
   "after every meal" => ["08:00","12:00","18:00"]
   "8am and 8pm" => ["08:00","20:00"]   // if an exact non-anchor time is given, use that exact "HH:MM"
 
+MEAL TIMES — for the "meal_times" object, extract the actual clock time stated for each meal as
+"HH:MM" (24-hour), or null if that meal isn't mentioned. These are exact times, NOT anchor slots.
+Thai time words: โมงเช้า=morning, เที่ยง=12:00, บ่าย=afternoon, โมงเย็น=evening,
+ทุ่ม=evening/night (1ทุ่ม=19:00, 2ทุ่ม=20:00, 3ทุ่ม=21:00, 4ทุ่ม=22:00). e.g.
+  "เช้า 7 โมงครึ่ง กลางวันเที่ยง เย็น 6 โมง ก่อนนอน 4 ทุ่ม" => {"morning":"07:30","midday":"12:00","evening":"18:00","bedtime":"22:00"}
+
 Guidance:
 - Thai "ตัวเอง/ดูแลตัวเอง/เอง" => care_mode "self"; "พ่อ/แม่/ดูแลพ่อแม่/คนอื่น/ให้ท่าน" => "family".
 - "ไม่มี/ไม่เป็นอะไร/สบายดี" for conditions => conditions "none".
@@ -797,11 +813,78 @@ Guidance:
 - IMPORTANT: never put dose or time words inside medication.name. "Metformin 500mg morning" => name "Metformin", dosage "500mg", schedule ["08:00"], time_given true.
 - A single message can fill several fields at once. Fill all that clearly apply.`;
 
+// Fast, deterministic mapping for the FIXED quick-reply button strings. The
+// onboarding buttons send exact, known text — there's no need to spend an LLM
+// round-trip to interpret them. Returns the same shape extractOnboardingInfo
+// would for these exact inputs, or null when the text isn't a known button
+// (caller then falls back to the LLM extractor for free-form input).
+const COND_BUTTON_TEXTS = new Set([
+  'ความดัน', 'เบาหวาน', 'ความดันและเบาหวาน',
+  'hypertension', 'diabetes', 'hypertension and diabetes',
+]);
+const TIME_BUTTON_SCHEDULES = {
+  'เช้า': ['08:00'],            'morning': ['08:00'],
+  'กลางวัน': ['12:00'],         'midday': ['12:00'],
+  'เย็น': ['18:00'],            'evening': ['18:00'],
+  'ก่อนนอน': ['21:00'],         'bedtime': ['21:00'],
+  'เช้าเย็น': ['08:00', '18:00'],            'morning and evening': ['08:00', '18:00'],
+  'เช้ากลางวันเย็น': ['08:00', '12:00', '18:00'], 'morning midday evening': ['08:00', '12:00', '18:00'],
+};
+function deterministicOnboardingInfo(text, step) {
+  const t = (text || '').trim();
+  if (!t) return null;
+
+  if (step === 'care_mode') {
+    if (t === 'ดูแลตัวเอง' || t === 'myself') return { care_mode: 'self' };
+    if (t === 'ดูแลพ่อแม่' || t === 'my parent') return { care_mode: 'family' };
+  }
+
+  if (step === 'conditions') {
+    if (t === 'ไม่มี' || t === 'none') return { conditions: 'none' };
+    if (COND_BUTTON_TEXTS.has(t)) return { conditions: t };
+  }
+
+  if (step === 'medications') {
+    if (t === 'ไม่มียา' || t === 'no medications') return { no_medications: true };
+    if (t === 'ถ่ายรูปยา' || t === 'photo') return { wants_photo: true };
+  }
+
+  if (step === 'med_time' && TIME_BUTTON_SCHEDULES[t]) {
+    return { schedule_reply: TIME_BUTTON_SCHEDULES[t] };
+  }
+
+  if (step === 'confirm') {
+    if (t === 'ถูกต้องแล้ว' || t === 'correct') return { confirms_correct: true };
+    if (t === 'อยากแก้ไข' || t === 'edit') return { wants_edit: true };
+  }
+
+  return null;
+}
+
+async function extractOnboardingInfo(text, profile, step) {
+  const known = {
+    language: profile.language,
+    care_mode: profile.care_mode,
+    self_name: profile.self_name,
+    patient_name: profile.patient_name,
+    conditions: profile.conditions,
+    meal_times_known: !!profile.meal_times,
+    waiting_for: step,
+  };
+
+  const context = `What we already know (for context — do not repeat unless the user is changing it):
+${JSON.stringify(known, null, 2)}
+
+We are currently waiting for: "${step}"
+
+User's latest message: "${text}"`;
+
   try {
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
+      model: 'claude-haiku-4-5-20251001',
       max_tokens: 400,
-      messages: [{ role: 'user', content: prompt }],
+      system: [{ type: 'text', text: ONBOARDING_EXTRACTOR_SYSTEM, cache_control: { type: 'ephemeral' } }],
+      messages: [{ role: 'user', content: context }],
     });
     const raw = response.content.find(b => b.type === 'text')?.text?.trim() || '{}';
     const m = raw.match(/\{[\s\S]*\}/);
@@ -945,9 +1028,11 @@ async function handleOnboarding(event, patient) {
   // Run the extractor for everything except the pure language pick
   // (which we may have just resolved above). The extractor is also how
   // we handle med names, done/confirm/edit signals, etc.
+  // Quick-reply buttons send fixed, known strings — resolve those without an LLM
+  // round-trip. Only free-form text falls through to the (slower) extractor.
   let info = {};
   if (profile.language && step !== 'language') {
-    info = await extractOnboardingInfo(text, profile, step);
+    info = deterministicOnboardingInfo(text, step) || await extractOnboardingInfo(text, profile, step);
   }
 
   // ---- Merge extracted info into the profile ----
@@ -969,7 +1054,9 @@ async function handleOnboarding(event, patient) {
   if (step === 'meal_times' && info.mentions_meal_times) {
     if (text.trim().length >= 3) {
       profile.meal_raw = text;
-      profile.meal_times = await parseMealTimes(text);
+      // Prefer the times the extractor already parsed in the same call; only fall
+      // back to the dedicated parseMealTimes() round-trip if it didn't return them.
+      profile.meal_times = normalizeMealTimes(info.meal_times) || await parseMealTimes(text);
       profile._showMealSaved = true; // show the saved-times summary once, next turn
       await persistProfile(patientId, profile, lineUserId);
     }
