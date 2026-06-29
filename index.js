@@ -222,6 +222,75 @@ async function buildMedCard(patientId, headerText = '💊 รายการย�
   };
 }
 
+// Default meal/medication times used when a slot is missing.
+const DEFAULT_MEAL_TIMES = { morning: '08:00', midday: '12:00', evening: '18:00', bedtime: '21:00' };
+
+// buildMealTimeCard: interactive Flex card shown during the meal_times
+// onboarding step. Each row has a datetimepicker edit button; the footer
+// confirm button posts back 'meal_times_confirmed'. Mirrors buildMedCard.
+function buildMealTimeCard(profile, l) {
+  const t = { ...DEFAULT_MEAL_TIMES, ...(profile.meal_times || {}) };
+  const name = profile.care_mode === 'family' ? profile.patient_name : profile.self_name;
+  const title = S(l, 'meal_card_title', name || '');
+
+  const SLOTS = [
+    { slot: 'morning', icon: '🌅' },
+    { slot: 'midday',  icon: '☀️' },
+    { slot: 'evening', icon: '🌆' },
+    { slot: 'bedtime', icon: '🌙' },
+  ];
+
+  const rows = SLOTS.map(({ slot, icon }) => ({
+    type: 'box', layout: 'horizontal', alignItems: 'center',
+    contents: [
+      { type: 'text', text: icon, size: 'sm', flex: 0 },
+      { type: 'text', text: S(l, 'meal_slot_' + slot), size: 'sm', color: '#1a1a1a', flex: 3, margin: 'sm', gravity: 'center' },
+      { type: 'text', text: t[slot], size: 'sm', weight: 'bold', color: '#1a1a1a', flex: 2, align: 'end', gravity: 'center' },
+      {
+        type: 'button', flex: 2, height: 'sm', style: 'link', gravity: 'center',
+        action: {
+          type: 'datetimepicker',
+          label: S(l, 'meal_edit_btn'),
+          data: 'edit_meal=' + slot,
+          mode: 'time',
+          initial: t[slot],
+          max: '23:59', min: '00:00',
+        },
+      },
+    ],
+    paddingTop: '8px', paddingBottom: '8px',
+  }));
+
+  return {
+    type: 'flex',
+    altText: title,
+    contents: {
+      type: 'bubble', size: 'kilo',
+      header: {
+        type: 'box', layout: 'vertical', spacing: 'xs',
+        contents: [
+          { type: 'text', text: title, weight: 'bold', size: 'md', color: '#ffffff' },
+          { type: 'text', text: S(l, 'meal_card_subtitle'), size: 'xs', color: '#e8f7ee' },
+        ],
+        backgroundColor: '#06C755', paddingAll: '14px',
+      },
+      body: {
+        type: 'box', layout: 'vertical',
+        contents: rows,
+        paddingAll: '12px', spacing: 'sm',
+      },
+      footer: {
+        type: 'box', layout: 'vertical',
+        contents: [{
+          type: 'button', style: 'primary', color: '#06C755', height: 'sm',
+          action: { type: 'postback', label: S(l, 'meal_confirm_btn'), data: 'meal_times_confirmed' },
+        }],
+        paddingAll: '10px',
+      },
+    },
+  };
+}
+
 // ============================================================
 // LINE QUICK REPLY BUILDER
 // ============================================================
@@ -317,6 +386,29 @@ const S = (lang, key, ...args) => {
     meal_times_retry: {
       th: 'ขอโทษครับ ลุงยังไม่เข้าใจ ช่วยพิมพ์เวลาอีกครั้งได้ไหมครับ\nเช่น "เช้า 7 โมงครึ่ง กลางวันเที่ยง เย็น 6 โมง ก่อนนอน 4 ทุ่ม"',
       en: 'Sorry, I didn\'t quite catch that. Could you type the times again? e.g.\n"breakfast 7:30am, lunch 12pm, dinner 6pm, bedtime 9pm"',
+    },
+    // Meal-time Flex card
+    meal_card_intro: {
+      th: 'ปกติทานข้าวและทานยากี่โมงครับ? ลุงตั้งเวลาให้ก่อน ถ้าไม่ตรงกดแก้ไขได้เลยครับ 😊',
+      en: 'What time do you usually eat and take medicine? I\'ve set some default times — tap edit to change any of them 😊',
+    },
+    meal_card_title: {
+      th: (name) => `🕐 เวลาทานยา${name ? 'ของคุณ' + name : ''}`,
+      en: (name) => `🕐 Medication times${name ? ' for ' + name : ''}`,
+    },
+    meal_card_subtitle: {
+      th: 'ลุงจะเตือนทานยาตามเวลานี้',
+      en: 'I\'ll remind based on these times',
+    },
+    meal_slot_morning: { th: 'เช้า', en: 'Morning' },
+    meal_slot_midday:  { th: 'กลางวัน', en: 'Midday' },
+    meal_slot_evening: { th: 'เย็น', en: 'Evening' },
+    meal_slot_bedtime: { th: 'ก่อนนอน', en: 'Bedtime' },
+    meal_edit_btn: { th: 'แก้ไข', en: 'Edit' },
+    meal_confirm_btn: { th: '✓ ใช้เวลานี้เลย', en: '✓ Use these times' },
+    meal_edited: {
+      th: (slotLabel, time) => `แก้ให้แล้วครับ ${slotLabel} เปลี่ยนเป็น ${time} ครับ`,
+      en: (slotLabel, time) => `Updated — ${slotLabel} changed to ${time}`,
     },
     condition_buttons: {
       th: [
@@ -1064,9 +1156,11 @@ async function advanceOnboarding(replyToken, patient, profile) {
     }
 
     case 'meal_times': {
-      const key = profile.care_mode === 'family' ? 'ask_meal_times_for' : 'ask_meal_times';
-      const arg = profile.care_mode === 'family' ? (profile.patient_name || '') : (profile.self_name || '');
-      await client.replyMessage({ replyToken, messages: [{ type: 'text', text: S(l, key, arg) }]});
+      const card = buildMealTimeCard(profile, l);
+      await client.replyMessage({ replyToken, messages: [
+        { type: 'text', text: S(l, 'meal_card_intro') },
+        card,
+      ]});
       return;
     }
 
@@ -2325,10 +2419,59 @@ async function processInviteMessage(event, lineUserId) {
   await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: msg }]});
 }
 
+// ============================================================
+// POSTBACK HANDLER — interactive Flex actions (meal-time card)
+// ============================================================
+async function handlePostback(event) {
+  const data = event.postback?.data || '';
+  const lineUserId = event.source.userId;
+  const patient = await getOrCreatePatient(lineUserId);
+  const patientId = patient.id;
+
+  // Only the onboarding meal-time card uses postbacks right now. Guard with
+  // the same onboarding check the other handlers use; anything else falls
+  // through untouched so future postback uses aren't broken.
+  if (!needsOnboarding(patient)) return;
+
+  const profile = await getProfile(patient);
+  const l = profile.language || 'th';
+
+  // 4a. A slot's time was edited via the time wheel.
+  if (data.startsWith('edit_meal=')) {
+    const slot = data.slice('edit_meal='.length);
+    const time = event.postback.params?.time; // 'HH:MM'
+    if (!['morning', 'midday', 'evening', 'bedtime'].includes(slot) || !time) return;
+
+    if (!profile.meal_times) profile.meal_times = { ...DEFAULT_MEAL_TIMES };
+    profile.meal_times[slot] = time;
+    await persistProfile(patientId, profile, lineUserId);
+
+    await client.replyMessage({ replyToken: event.replyToken, messages: [
+      { type: 'text', text: S(l, 'meal_edited', S(l, 'meal_slot_' + slot), time) },
+      buildMealTimeCard(profile, l),
+    ]});
+    return; // still editing — do not advance
+  }
+
+  // 4b. The user confirmed the times → seed defaults if needed and advance.
+  if (data === 'meal_times_confirmed') {
+    if (!profile.meal_times) profile.meal_times = { ...DEFAULT_MEAL_TIMES };
+    await persistProfile(patientId, profile, lineUserId);
+    await advanceOnboarding(event.replyToken, patient, profile);
+    return;
+  }
+}
+
 async function handleEvent(event) {
   // ── Follow event: user adds the bot ───────────────────────
   if (event.type === 'follow') {
     await handleFollow(event);
+    return;
+  }
+
+  // ── Postback event: interactive Flex actions (e.g. meal-time card) ──
+  if (event.type === 'postback') {
+    await handlePostback(event);
     return;
   }
 
