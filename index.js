@@ -20,6 +20,13 @@ pool.query('SELECT NOW()')
   .then(() => console.log('✅ Database connected'))
   .catch(err => console.error('❌ Database connection failed:', err.message));
 
+// Idempotent startup migration — tracks whether a stale-invite nudge was already
+// pushed for a token, so the daily nudge cron doesn't repeat-pester guardians.
+// Safe to run on every boot (IF NOT EXISTS); auto-applies on deploy.
+pool.query(`ALTER TABLE invite_tokens ADD COLUMN IF NOT EXISTS nudge_sent BOOLEAN DEFAULT FALSE`)
+  .then(() => console.log('✅ invite_tokens.nudge_sent ready'))
+  .catch(err => console.error('❌ nudge_sent migration failed:', err.message));
+
 const lineConfig = {
   channelSecret: process.env.LINE_CHANNEL_SECRET,
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
@@ -32,6 +39,17 @@ const blobClient = new line.messagingApi.MessagingApiBlobClient({
 });
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const app = express();
+
+// Fail loud on a misconfigured deploy. A missing LINE_BOT_ID in particular makes
+// createInviteLink fall back to a token-less URL, so invited parents silently land
+// in solo onboarding and the guardian's placeholder is orphaned. Crash at boot
+// instead of shipping dead invite links.
+const REQUIRED_ENV = ['LINE_CHANNEL_SECRET', 'LINE_CHANNEL_ACCESS_TOKEN', 'LINE_BOT_ID', 'DATABASE_URL', 'ANTHROPIC_API_KEY'];
+const missingEnv = REQUIRED_ENV.filter(k => !process.env[k]);
+if (missingEnv.length) {
+  console.error(`❌ FATAL: missing required env vars: ${missingEnv.join(', ')}`);
+  process.exit(1);
+}
 
 // ============================================================
 // SYSTEM PROMPT
@@ -100,6 +118,10 @@ For "log_reading", extract entities like:
 {"type":"bp","value_1":130,"value_2":85,"unit":"mmHg"}
 {"type":"glucose","value_1":7.2,"unit":"mmol"}
 {"type":"weight","value_1":65,"unit":"kg"}
+
+For "send_invite", extract ONLY the invited person's name if one is clearly given,
+stripping titles and politeness words: {"name":"สมศรี"} — or {"name":null} if none.
+(e.g. "เพิ่มคุณแม่ด้วยนะครับ" → {"name":null}; "เชิญสมศรี" → {"name":"สมศรี"})
 
 For other intents, entities can be {} or relevant extracted info.`;
 
@@ -619,7 +641,7 @@ const S = (lang, key, ...args) => {
       en: (name) => `Welcome, ${name || ''}! 🎉\nUncle Note is ready to look after you.\nYour family will receive health updates too 😊\n\nFeel free to log your BP, blood sugar, or any symptoms!`,
     },
     invite_used:    { th: 'ขอโทษครับ ลิงก์นี้ถูกใช้ไปแล้ว ขอให้ลูกหลานสร้างลิงก์ใหม่ให้นะครับ', en: 'Sorry, this link has already been used. Please ask your family to send a new one.' },
-    invite_expired: { th: 'ขอโทษครับ ลิงก์หมดอายุแล้ว (ใช้ได้แค่ 24 ชั่วโมง) ขอให้ลูกหลานสร้างลิงก์ใหม่ให้นะครับ', en: 'Sorry, this link has expired (valid for 24 hours). Please ask your family to send a new one.' },
+    invite_expired: { th: 'ขอโทษครับ ลิงก์หมดอายุแล้ว ขอให้ลูกหลานสร้างลิงก์ใหม่ให้นะครับ', en: 'Sorry, this link has expired. Please ask your family to send a new one.' },
     invite_linked:  { th: 'คุณเชื่อมต่อกับลุงโน้ตอยู่แล้วนะครับ 😊 พิมพ์มาคุยกับลุงได้เลยครับ', en: 'You\'re already connected to Uncle Note 😊 Feel free to chat!' },
     invite_invalid: { th: 'ขอโทษครับ ลิงก์ไม่ถูกต้อง ขอให้ลูกหลานส่งลิงก์ใหม่ให้นะครับ', en: 'Sorry, this link is not valid. Please ask your family to send a new one.' },
 
@@ -646,6 +668,14 @@ const S = (lang, key, ...args) => {
       th: (patientName, guardianName) => `✅ คุณ${patientName}เชื่อมต่อกับลุงโน้ตแล้วครับ!\nลุงพร้อมดูแลและส่งรายงานให้คุณ${guardianName}แล้วนะครับ 😊`,
       en: (patientName, guardianName) => `✅ ${patientName} is now connected to Uncle Note!\nI'll look after them and keep you${guardianName ? `, ${guardianName},` : ''} updated 😊`,
     },
+    guardian_invite_accepted_refreshed: {
+      th: (patientName, guardianName) => `✅ คุณ${patientName}เชื่อมต่อกับลุงโน้ตแล้วครับ! (ลิงก์หมดอายุพอดี ลุงต่ออายุให้อัตโนมัติ 😊)\nลุงพร้อมดูแลและส่งรายงานให้คุณ${guardianName}แล้วนะครับ`,
+      en: (patientName, guardianName) => `✅ ${patientName} is now connected to Uncle Note! (The link had just expired — I refreshed it automatically 😊)\nI'll look after them and keep you${guardianName ? `, ${guardianName},` : ''} updated`,
+    },
+    guardian_invite_nudge: {
+      th: (label) => `📨 ลิงก์เชิญ${label}ใกล้หมดอายุแล้วครับ และยังไม่ได้กดเลย\nกดปุ่มด้านล่างเพื่อส่งลิงก์ใหม่ให้ท่านได้เลยครับ 😊`,
+      en: (label) => `📨 The invite link for ${label} is about to expire and hasn't been used yet.\nTap below to send a fresh link 😊`,
+    },
   };
 
   const entry = strings[key];
@@ -664,6 +694,15 @@ async function getOrCreatePatient(lineUserId) {
   const existing = await pool.query('SELECT * FROM patients WHERE line_user_id = $1', [lineUserId]);
   if (existing.rows.length > 0) return existing.rows[0];
 
+  // Guard: never auto-spawn a solo patient for someone who is already a guardian.
+  // A guardian's own messages must not mint a second, disconnected solo household
+  // (which would pollute the data — the same person counted as both guardian and
+  // accidental patient). In the normal flow the guardian's own row is found above;
+  // this only fires if that row is somehow missing, in which case we route them to
+  // the patient they already oversee rather than creating a throwaway account.
+  const overseen = await overseenPatientForGuardian(lineUserId);
+  if (overseen) return overseen;
+
   const hhResult = await pool.query(`INSERT INTO households (mode) VALUES ('solo') RETURNING id`);
   const householdId = hhResult.rows[0].id;
 
@@ -675,6 +714,23 @@ async function getOrCreatePatient(lineUserId) {
   await pool.query(`INSERT INTO subscriptions (household_id, status) VALUES ($1, 'trial')`, [householdId]);
   console.log(`✅ New patient: ${patientResult.rows[0].id}`);
   return patientResult.rows[0];
+}
+
+// The patient a guardian oversees in their household. Used only as the fallback in
+// getOrCreatePatient when a guardian has no patient row of their own — prefer the
+// still-unlinked invite placeholder so we never write a guardian's chat into the
+// parent's live linked record. Returns null for non-guardians.
+async function overseenPatientForGuardian(lineUserId) {
+  const g = await pool.query(`SELECT household_id FROM guardians WHERE line_user_id=$1`, [lineUserId]);
+  if (g.rows.length === 0) return null;
+  const p = await pool.query(
+    `SELECT * FROM patients
+       WHERE household_id=$1 AND onboarding_state <> 'superseded'
+       ORDER BY (line_user_id IS NULL) DESC, (onboarding_state='pending_invite') DESC
+       LIMIT 1`,
+    [g.rows[0].household_id]
+  );
+  return p.rows[0] || null;
 }
 
 // Convenience: get patient language, defaults to 'th'
@@ -2280,6 +2336,92 @@ async function notifyGuardianAppt(appt, hours) {
 console.log('📅 Appointment reminder cron scheduled (every hour)');
 
 // ============================================================
+// STALE INVITE NUDGE CRON — daily at 10:00 Bangkok (03:00 UTC)
+// Finds unused invite tokens at/near expiry and nudges the guardian with a
+// one-tap "resend link". nudge_sent guards against repeat-pestering.
+// ============================================================
+cron.schedule('0 3 * * *', async () => {
+  console.log('📨 Checking stale invite tokens...');
+  try {
+    const stale = await pool.query(
+      `SELECT it.token, it.patient_id, p.display_name, p.household_id,
+              g.line_user_id AS guardian_uid, g.language AS guardian_language
+         FROM invite_tokens it
+         JOIN patients p ON p.id = it.patient_id
+         JOIN guardians g ON g.household_id = p.household_id
+        WHERE it.used = FALSE
+          AND it.nudge_sent = FALSE
+          AND it.expires_at <= NOW() + INTERVAL '24 hours'   -- within 24h of expiry, or already past
+          AND p.onboarding_state = 'pending_invite'
+          AND g.line_user_id IS NOT NULL`,
+      []
+    );
+    console.log(`📨 ${stale.rows.length} stale invite(s) to nudge`);
+    for (const t of stale.rows) {
+      try {
+        const gl = t.guardian_language === 'en' ? 'en' : 'th';
+        const label = t.display_name
+          ? (gl === 'en' ? t.display_name : `คุณ${t.display_name}`)
+          : (gl === 'en' ? 'your parent' : 'ท่าน');
+        await client.pushMessage({
+          to: t.guardian_uid,
+          messages: [buildQuickReply(
+            S(gl, 'guardian_invite_nudge', label),
+            [{ label: gl === 'en' ? 'Resend link' : 'ส่งลิงก์ใหม่', text: 'เชิญ ' + (t.display_name || '') }]
+          )],
+        });
+        await pool.query(`UPDATE invite_tokens SET nudge_sent=TRUE WHERE token=$1`, [t.token]);
+        console.log(`📨 Invite nudge sent to guardian for ${label}`);
+      } catch (err) { console.error('❌ Invite nudge failed:', err.message); }
+    }
+  } catch (err) { console.error('❌ Invite nudge cron:', err.message); }
+});
+console.log('📨 Invite nudge cron scheduled (10:00 Bangkok)');
+
+// ============================================================
+// ORPHANED PLACEHOLDER CLEANUP CRON — weekly, Sun 11:00 Bangkok (04:00 UTC)
+// Removes never-tapped invite placeholders whose tokens all expired+unused over
+// 30 days ago. Only genuinely-empty placeholders (no LINE user, no meds, no
+// health logs) are touched; the shared household + guardian are never deleted.
+// ============================================================
+cron.schedule('0 4 * * 0', async () => {
+  console.log('🧹 Cleaning orphaned invite placeholders...');
+  try {
+    const orphans = await pool.query(
+      `SELECT p.id FROM patients p
+        WHERE p.onboarding_state='pending_invite'
+          AND p.line_user_id IS NULL
+          AND NOT EXISTS (SELECT 1 FROM medications m WHERE m.patient_id=p.id)
+          AND NOT EXISTS (SELECT 1 FROM health_logs h WHERE h.patient_id=p.id)
+          AND EXISTS     (SELECT 1 FROM invite_tokens it WHERE it.patient_id=p.id)
+          AND NOT EXISTS (
+                SELECT 1 FROM invite_tokens it
+                 WHERE it.patient_id=p.id
+                   AND (it.used=TRUE OR it.expires_at > NOW() - INTERVAL '30 days')
+              )`,
+      []
+    );
+    console.log(`🧹 ${orphans.rows.length} orphaned placeholder(s) to remove`);
+    for (const o of orphans.rows) {
+      const dbClient = await pool.connect();
+      try {
+        await dbClient.query('BEGIN');
+        await dbClient.query(`DELETE FROM invite_tokens WHERE patient_id=$1`, [o.id]);
+        await dbClient.query(`DELETE FROM patients WHERE id=$1`, [o.id]);
+        await dbClient.query('COMMIT');
+        console.log(`🧹 Removed orphaned placeholder ${o.id}`);
+      } catch (err) {
+        await dbClient.query('ROLLBACK');
+        console.error('🧹 Placeholder cleanup row failed:', err.message);
+      } finally {
+        dbClient.release();
+      }
+    }
+  } catch (err) { console.error('❌ Placeholder cleanup cron:', err.message); }
+});
+console.log('🧹 Placeholder cleanup cron scheduled (weekly, Sun 11:00 Bangkok)');
+
+// ============================================================
 // CAREGIVER DASHBOARD — Flex Message card
 // Served from DB → zero LLM cost per check
 // ============================================================
@@ -2429,6 +2571,36 @@ function generateToken() {
   return token;
 }
 
+// LINE deep link — when tapped, opens the bot chat and auto-sends INVITE_<token>.
+function buildInviteDeepLink(token) {
+  const botId = process.env.LINE_BOT_ID || '';
+  return botId
+    ? `https://line.me/R/oaMessage/${botId}/?INVITE_${token}`
+    : `https://line.me/ti/p/@lungnote`; // fallback (boot guard makes this unreachable)
+}
+
+// Pull the invited person's name from a guardian's "เชิญ/เพิ่ม ..." message.
+// Prefer a name the intent router already extracted; otherwise parse the raw text
+// and strip trailing Thai particles so politeness words (ด้วย/นะ/ครับ/ค่ะ/หน่อย…)
+// don't get saved as the patient's name. Returns null when no real name is given.
+function extractInviteName(userMessage, entities) {
+  let name = (entities && typeof entities.name === 'string' && entities.name !== 'null')
+    ? entities.name : null;
+  if (!name) {
+    const m = userMessage.match(
+      /(?:เชิญ|เพิ่ม)\s*(?:คุณพ่อ|คุณแม่|คุณ|พ่อ|แม่|ผู้ป่วย|สมาชิก)?\s*([\p{L}][\p{L}\p{M}\p{N} .]{0,19})?/u
+    );
+    name = (m && m[1]) ? m[1] : null;
+  }
+  if (!name) return null;
+  name = name.trim()
+    // drop trailing politeness / filler particles (may be chained without spaces)
+    .replace(/(?:\s*(?:ด้วย|นะ|น่ะ|ครับ|ค่ะ|คะ|หน่อย|ให้|จ้า|จ๊ะ|ที|แล้ว|เลย))+$/gu, '')
+    .replace(/[.,!?]+$/u, '')
+    .trim();
+  return name || null;
+}
+
 // Create invite for a guardian — one token per patient slot
 async function createInviteLink(guardianLineUserId, patientName) {
   // Ensure guardian record exists
@@ -2440,124 +2612,192 @@ async function createInviteLink(guardianLineUserId, patientName) {
     throw new Error('Guardian record not found');
   }
 
-  const { id: guardianId, household_id: householdId } = guardianResult.rows[0];
+  const { household_id: householdId } = guardianResult.rows[0];
 
-  // Create a new patient record (placeholder — filled when patient taps link)
-  const patientResult = await pool.query(
-    `INSERT INTO patients (household_id, display_name, care_mode, onboarding_state)
-     VALUES ($1, $2, 'family', 'pending_invite')
-     RETURNING id`,
+  // Idempotency: reuse an existing pending-invite placeholder for the same person
+  // instead of stacking a fresh patients row (and token) on every "เชิญ" tap —
+  // those orphans pollute the dashboard and per-household counts. Match on
+  // display_name so distinct people in one household keep distinct slots.
+  const existing = await pool.query(
+    `SELECT id FROM patients
+       WHERE household_id=$1 AND onboarding_state='pending_invite' AND line_user_id IS NULL
+         AND display_name IS NOT DISTINCT FROM $2
+       LIMIT 1`,
     [householdId, patientName || null]
   );
-  const patientId = patientResult.rows[0].id;
 
-  // Generate one-time token valid for 24h
+  let patientId;
+  if (existing.rows.length > 0) {
+    patientId = existing.rows[0].id;
+    // Refresh and reuse a still-unused token if one exists, so a re-invite keeps
+    // any link already shared working instead of orphaning a token each time.
+    const liveToken = await pool.query(
+      `SELECT token FROM invite_tokens
+         WHERE patient_id=$1 AND used=FALSE
+         ORDER BY expires_at DESC LIMIT 1`,
+      [patientId]
+    );
+    if (liveToken.rows.length > 0) {
+      const token = liveToken.rows[0].token;
+      await pool.query(
+        `UPDATE invite_tokens SET expires_at=NOW() + INTERVAL '7 days', nudge_sent=FALSE WHERE token=$1`,
+        [token]
+      );
+      return { token, deepLink: buildInviteDeepLink(token), patientId, patientName };
+    }
+  } else {
+    // Create a new placeholder patient record (filled when the patient taps link).
+    const patientResult = await pool.query(
+      `INSERT INTO patients (household_id, display_name, care_mode, onboarding_state)
+       VALUES ($1, $2, 'family', 'pending_invite')
+       RETURNING id`,
+      [householdId, patientName || null]
+    );
+    patientId = patientResult.rows[0].id;
+  }
+
+  // Generate one-time token valid for 7 days. (Expired-but-unused tokens still
+  // self-heal in handleInviteToken, so this window is a soft limit, not a wall.)
   const token = generateToken();
   await pool.query(
     `INSERT INTO invite_tokens (patient_id, token, expires_at)
-     VALUES ($1, $2, NOW() + INTERVAL '24 hours')`,
+     VALUES ($1, $2, NOW() + INTERVAL '7 days')`,
     [patientId, token]
   );
 
-  // LINE deep link — when tapped, opens LINE chat with bot
-  // and auto-sends the token as a message
-  const botId = process.env.LINE_BOT_ID || '';
-  const deepLink = botId
-    ? `https://line.me/R/oaMessage/${botId}/?INVITE_${token}`
-    : `https://line.me/ti/p/@lungnote`; // fallback
-
-  return { token, deepLink, patientId, patientName };
+  return { token, deepLink: buildInviteDeepLink(token), patientId, patientName };
 }
 
-// Handle invite token sent by patient clicking the link
+// Handle invite token sent by patient clicking the link.
+//
+// Runs as a single transaction with the token row locked FOR UPDATE so that the
+// follow event (which auto-creates a shell patient) and the INVITE_ message —
+// which LINE can deliver in separate, concurrent webhook POSTs — can't race into
+// a check-then-act gap that strands the parent on an empty solo account.
 async function handleInviteToken(lineUserId, token) {
-  // Look up the token
-  const tokenResult = await pool.query(
-    `SELECT it.patient_id, it.used, it.expires_at, p.display_name, p.household_id
-     FROM invite_tokens it
-     JOIN patients p ON p.id = it.patient_id
-     WHERE it.token = $1`,
-    [token]
-  );
+  const dbClient = await pool.connect();
+  let outcome = null;        // value returned to processInviteMessage
+  let shellToClear = null;   // in-memory caches to drop AFTER commit
+  let notify = null;         // guardian push details, sent AFTER commit
+  try {
+    await dbClient.query('BEGIN');
 
-  if (tokenResult.rows.length === 0) {
-    return { success: false, reason: 'not_found' };
-  }
+    // Lock the token row; concurrent taps of the same token now serialize.
+    const tokenResult = await dbClient.query(
+      `SELECT it.id, it.patient_id, it.used, it.expires_at,
+              p.display_name, p.household_id, p.onboarding_state
+         FROM invite_tokens it
+         JOIN patients p ON p.id = it.patient_id
+        WHERE it.token = $1
+        FOR UPDATE OF it`,
+      [token]
+    );
 
-  const row = tokenResult.rows[0];
+    if (tokenResult.rows.length === 0) { await dbClient.query('ROLLBACK'); return { success: false, reason: 'not_found' }; }
+    const row = tokenResult.rows[0];
+    if (row.used)                       { await dbClient.query('ROLLBACK'); return { success: false, reason: 'used' }; }
 
-  if (row.used) return { success: false, reason: 'used' };
-  if (new Date(row.expires_at) < new Date()) return { success: false, reason: 'expired' };
-
-  // Check if this LINE user already has a patient record.
-  // A brand-new invited user already owns an empty "shell" patient that the
-  // follow event auto-created (getOrCreatePatient). That shell must NOT block
-  // the invite — we detach it and move this LINE user onto the guardian's
-  // placeholder patient. Only a fully-onboarded patient is genuinely linked.
-  const existingPatient = await pool.query(
-    `SELECT id, onboarding_state FROM patients WHERE line_user_id=$1`, [lineUserId]
-  );
-  if (existingPatient.rows.length > 0) {
-    const ex = existingPatient.rows[0];
-    if (ex.onboarding_state === 'complete') {
-      return { success: false, reason: 'already_linked' };
+    // Self-heal expired-but-unused tokens. The clock lapsed but the guardian's
+    // intent — proving they meant to link this person — is still valid, and the
+    // placeholder is still waiting. Dead-ending here would fail at the exact
+    // moment the parent finally taps. So link anyway and flag the guardian
+    // notification as "auto-refreshed". Only refuse if the placeholder is no
+    // longer a fresh pending invite (already used up another way).
+    let wasExpired = false;
+    if (new Date(row.expires_at) < new Date()) {
+      if (row.onboarding_state !== 'pending_invite') {
+        await dbClient.query('ROLLBACK');
+        return { success: false, reason: 'expired' };
+      }
+      wasExpired = true;
     }
-    if (ex.id !== row.patient_id) {
-      // Detach the shell (clear line_user_id first to satisfy the unique
-      // constraint before we reassign it to the placeholder below).
-      await pool.query(
+
+    // Does this LINE user already own a patient row? A brand-new invited user
+    // owns an empty shell auto-created by their follow event.
+    const existing = await dbClient.query(
+      `SELECT id, onboarding_state FROM patients WHERE line_user_id=$1`, [lineUserId]
+    );
+    if (existing.rows.length > 0) {
+      const ex = existing.rows[0];
+
+      // Same placeholder already linked to this user → idempotent success
+      // (e.g. they tapped the link twice). Don't error.
+      if (ex.id === row.patient_id) {
+        await dbClient.query(`UPDATE invite_tokens SET used=TRUE WHERE id=$1`, [row.id]);
+        await dbClient.query('COMMIT');
+        return { success: true, patientName: row.display_name, householdId: row.household_id, alreadyLinked: true };
+      }
+
+      // A fully-onboarded patient with this LINE id → genuinely already linked.
+      if (ex.onboarding_state === 'complete') {
+        await dbClient.query('ROLLBACK');
+        return { success: false, reason: 'already_linked' };
+      }
+
+      // Otherwise it's an empty auto-created shell — retire it so its line_user_id
+      // is freed (UNIQUE) for the placeholder below. (We retire rather than DELETE
+      // to stay safe regardless of FK cascade behaviour; a weekly cleanup cron can
+      // sweep superseded rows later.)
+      await dbClient.query(
         `UPDATE patients SET line_user_id=NULL, onboarding_state='superseded' WHERE id=$1`,
         [ex.id]
       );
-      clearProfile(ex.id);
-      medCache.delete(ex.id);
+      shellToClear = ex.id;
     }
+
+    // Link this LINE user to the placeholder patient record.
+    await dbClient.query(
+      `UPDATE patients
+         SET line_user_id=$1, onboarding_state='complete', consented=TRUE, consent_at=NOW()
+       WHERE id=$2`,
+      [lineUserId, row.patient_id]
+    );
+    await dbClient.query(`UPDATE invite_tokens SET used=TRUE WHERE id=$1`, [row.id]);
+    await dbClient.query(
+      `INSERT INTO patient_trials (patient_id) VALUES ($1) ON CONFLICT DO NOTHING`,
+      [row.patient_id]
+    );
+
+    await dbClient.query('COMMIT');
+
+    outcome = { success: true, patientName: row.display_name, householdId: row.household_id };
+    notify = { householdId: row.household_id, patientLabel: row.display_name, wasExpired };
+  } catch (err) {
+    await dbClient.query('ROLLBACK');
+    console.error('❌ handleInviteToken transaction failed:', err.message);
+    return { success: false, reason: 'error' };
+  } finally {
+    dbClient.release();
   }
 
-  // Link this LINE user to the placeholder patient record
-  await pool.query(
-    `UPDATE patients
-     SET line_user_id=$1, onboarding_state='complete', consented=TRUE, consent_at=NOW()
-     WHERE id=$2`,
-    [lineUserId, row.patient_id]
-  );
+  // ---- side effects, only after a successful commit ----
+  if (shellToClear) { clearProfile(shellToClear); medCache.delete(shellToClear); }
 
-  // Mark token as used
-  await pool.query(
-    `UPDATE invite_tokens SET used=TRUE WHERE token=$1`, [token]
-  );
-
-  // Create a trial subscription for this patient
-  await pool.query(
-    `INSERT INTO patient_trials (patient_id) VALUES ($1) ON CONFLICT DO NOTHING`,
-    [row.patient_id]
-  );
-
-  // Notify the guardian
-  const guardianResult = await pool.query(
-    `SELECT g.line_user_id, g.display_name, g.language as guardian_language FROM guardians g
-     WHERE g.household_id=$1`, [row.household_id]
-  );
-
-  if (guardianResult.rows.length > 0) {
-    const gl = guardianResult.rows[0].guardian_language === 'en' ? 'en' : 'th';
-    const guardianName = guardianResult.rows[0].display_name || '';
-    const patientLabel = row.display_name || (gl === 'en' ? 'your parent' : 'ท่าน');
-    await client.pushMessage({
-      to: guardianResult.rows[0].line_user_id,
-      messages: [{ type: 'text', text: S(gl, 'guardian_invite_accepted', patientLabel, guardianName) }],
-    });
+  // Notify the guardian (a push is a side effect — kept out of the transaction).
+  try {
+    const guardianResult = await pool.query(
+      `SELECT g.line_user_id, g.display_name, g.language as guardian_language FROM guardians g
+       WHERE g.household_id=$1`, [notify.householdId]
+    );
+    if (guardianResult.rows.length > 0 && guardianResult.rows[0].line_user_id) {
+      const gl = guardianResult.rows[0].guardian_language === 'en' ? 'en' : 'th';
+      const guardianName = guardianResult.rows[0].display_name || '';
+      const patientLabel = notify.patientLabel || (gl === 'en' ? 'your parent' : 'ท่าน');
+      const key = notify.wasExpired ? 'guardian_invite_accepted_refreshed' : 'guardian_invite_accepted';
+      await client.pushMessage({
+        to: guardianResult.rows[0].line_user_id,
+        messages: [{ type: 'text', text: S(gl, key, patientLabel, guardianName) }],
+      });
+    }
+  } catch (err) {
+    console.error('❌ Guardian invite-accepted notify failed:', err.message);
   }
 
-  return {
-    success: true,
-    patientName: row.display_name,
-    householdId: row.household_id,
-  };
+  return outcome;
 }
 
 // Build invite Flex Message card for guardian
-function buildInviteCard(deepLink, patientName, expiresIn = '24 ชั่วโมง') {
+function buildInviteCard(deepLink, patientName, expiresIn = '7 วัน') {
   // The footer button must open LINE's share target picker so the guardian can
   // forward the invite to the person they care for. A bare oaMessage deep link
   // (`line.me/R/oaMessage/...`) instead opens the guardian's OWN chat with the
@@ -2608,6 +2848,15 @@ function buildInviteCard(deepLink, patientName, expiresIn = '24 ชั่วโ�
 
 async function handleFollow(event) {
   const lineUserId = event.source.userId;
+
+  // A returning guardian (re-adds the bot after removing it) already has an
+  // account — don't run the solo welcome / language picker for them, and don't
+  // let getOrCreatePatient touch their data.
+  if (await isGuardian(lineUserId)) {
+    console.log(`👋 Follow from existing guardian: ${lineUserId}`);
+    return;
+  }
+
   // Create patient record in 'new' state if not exists
   const patient = await getOrCreatePatient(lineUserId);
   // Send bilingual welcome + language picker via push
@@ -2890,8 +3139,7 @@ async function handleTextMessage(event, patientId) {
 
   // ── send_invite ────────────────────────────────────────────
   if (intent === 'send_invite' && guardianUser) {
-    const nameMatch = userMessage.match(/(?:เชิญ|เพิ่ม)(?:คุณพ่อ|คุณแม่|พ่อ|แม่|ผู้ป่วย|สมาชิก)?\s*(.{1,20})?/);
-    const patientName = nameMatch?.[1]?.trim() || null;
+    const patientName = extractInviteName(userMessage, entities);
     try {
       const { deepLink } = await createInviteLink(lineUserId, patientName);
       const card = buildInviteCard(deepLink, patientName);
