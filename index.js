@@ -20,12 +20,25 @@ pool.query('SELECT NOW()')
   .then(() => console.log('✅ Database connected'))
   .catch(err => console.error('❌ Database connection failed:', err.message));
 
-// Idempotent startup migration — tracks whether a stale-invite nudge was already
-// pushed for a token, so the daily nudge cron doesn't repeat-pester guardians.
-// Safe to run on every boot (IF NOT EXISTS); auto-applies on deploy.
-pool.query(`ALTER TABLE invite_tokens ADD COLUMN IF NOT EXISTS nudge_sent BOOLEAN DEFAULT FALSE`)
-  .then(() => console.log('✅ invite_tokens.nudge_sent ready'))
-  .catch(err => console.error('❌ nudge_sent migration failed:', err.message));
+// Idempotent startup migrations — keep the live schema in sync with columns the
+// app writes. All guarded with IF NOT EXISTS, so they are safe to run on every
+// boot and auto-apply on deploy.
+//   - invite_tokens.nudge_sent: stale-invite nudge cron de-dup flag.
+//   - patients.consented / consent_at: written when a patient accepts an invite;
+//     missing columns here would abort the link transaction and silently reject
+//     a valid invite ("ลิงก์ไม่ถูกต้อง").
+(async () => {
+  const migrations = [
+    `ALTER TABLE invite_tokens ADD COLUMN IF NOT EXISTS nudge_sent BOOLEAN DEFAULT FALSE`,
+    `ALTER TABLE patients ADD COLUMN IF NOT EXISTS consented BOOLEAN DEFAULT FALSE`,
+    `ALTER TABLE patients ADD COLUMN IF NOT EXISTS consent_at TIMESTAMPTZ`,
+  ];
+  for (const sql of migrations) {
+    try { await pool.query(sql); }
+    catch (err) { console.error('❌ startup migration failed:', sql, '→', err.message); }
+  }
+  console.log('✅ startup migrations applied');
+})();
 
 // Idempotent startup migration — medications reference table + per-med
 // food_relation / route. Lets saveMedicationToDB auto-look up how each drug is
@@ -2795,6 +2808,7 @@ async function createInviteLink(guardianLineUserId, patientName) {
         `UPDATE invite_tokens SET expires_at=NOW() + INTERVAL '7 days', nudge_sent=FALSE WHERE token=$1`,
         [token]
       );
+      console.log(`🔗 Invite token reused: token=${token} patient=${patientId} name=${patientName || '-'}`);
       return { token, deepLink: buildInviteDeepLink(token), patientId, patientName };
     }
   } else {
@@ -2817,6 +2831,7 @@ async function createInviteLink(guardianLineUserId, patientName) {
     [patientId, token]
   );
 
+  console.log(`🔗 Invite token created: token=${token} patient=${patientId} name=${patientName || '-'}`);
   return { token, deepLink: buildInviteDeepLink(token), patientId, patientName };
 }
 
@@ -2905,15 +2920,11 @@ async function handleInviteToken(lineUserId, token) {
       [lineUserId, row.patient_id]
     );
     await dbClient.query(`UPDATE invite_tokens SET used=TRUE WHERE id=$1`, [row.id]);
-    await dbClient.query(
-      `INSERT INTO patient_trials (patient_id) VALUES ($1) ON CONFLICT DO NOTHING`,
-      [row.patient_id]
-    );
 
     await dbClient.query('COMMIT');
 
     outcome = { success: true, patientName: row.display_name, householdId: row.household_id };
-    notify = { householdId: row.household_id, patientLabel: row.display_name, wasExpired };
+    notify = { householdId: row.household_id, patientLabel: row.display_name, patientId: row.patient_id, wasExpired };
   } catch (err) {
     await dbClient.query('ROLLBACK');
     console.error('❌ handleInviteToken transaction failed:', err.message);
@@ -2924,6 +2935,18 @@ async function handleInviteToken(lineUserId, token) {
 
   // ---- side effects, only after a successful commit ----
   if (shellToClear) { clearProfile(shellToClear); medCache.delete(shellToClear); }
+
+  // Best-effort trial record — kept OUT of the critical transaction so a missing
+  // patient_trials table/constraint can never roll back (and silently reject) a
+  // valid link. Linking the patient is what matters; the trial row is secondary.
+  try {
+    await pool.query(
+      `INSERT INTO patient_trials (patient_id) VALUES ($1) ON CONFLICT DO NOTHING`,
+      [notify.patientId]
+    );
+  } catch (err) {
+    console.error('⚠️ patient_trials insert failed (non-fatal):', err.message);
+  }
 
   // Notify the guardian (a push is a side effect — kept out of the transaction).
   try {
@@ -3045,6 +3068,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
 async function processInviteMessage(event, lineUserId) {
   const token = event.message.text.trim().slice('INVITE_'.length).trim();
   const result = await handleInviteToken(lineUserId, token);
+  console.log(`🔗 Invite attempt: token=${token} → ${result.success ? 'success' : result.reason}`);
   // Language unknown at this point — use 'th' default, patient will set it in onboarding
   const inviteLang = 'th';
   let msg;
