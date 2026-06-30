@@ -729,10 +729,6 @@ const S = (lang, key, ...args) => {
       th: 'พิมพ์ชื่อยามาได้เลยครับ เช่น "Amlodipine 5mg"\nลุงจะถามเวลากินให้ครับ 💊',
       en: 'Type the medication name, e.g. "Amlodipine 5mg"\nI\'ll ask when you take it 💊',
     },
-    ask_med_dose: {
-      th: (name) => `${name} — ทานครั้งละกี่เม็ดครับ?\nกดเลือกด้านล่าง หรือพิมพ์จำนวนเม็ดมาได้เลยครับ`,
-      en: (name) => `${name} — how many do you take each time?\nTap a button below, or just type the number of tablets`,
-    },
     ask_med_strength: {
       th: (name) => `${name} — ขนาด/ความแรงเท่าไหร่ครับ?\nเช่น 5mg, 500mg, 0.5% — ถ้าไม่ทราบกดข้ามได้ครับ`,
       en: (name) => `${name} — what strength is it?\ne.g. 5mg, 500mg, 0.5% — tap skip if you're not sure`,
@@ -740,20 +736,6 @@ const S = (lang, key, ...args) => {
     strength_buttons: {
       th: [{ label: '🤔 ไม่ทราบ / ข้าม', text: 'ข้ามความแรง' }],
       en: [{ label: '🤔 Not sure / skip', text: 'skip strength' }],
-    },
-    dose_buttons: {
-      th: [
-        { label: '½ เม็ด', text: 'ครึ่งเม็ด' },
-        { label: '1 เม็ด', text: '1 เม็ด' },
-        { label: '2 เม็ด', text: '2 เม็ด' },
-        { label: '🤔 ไม่แน่ใจ', text: 'ไม่แน่ใจ' },
-      ],
-      en: [
-        { label: '½ tablet', text: 'half tablet' },
-        { label: '1 tablet', text: '1 tablet' },
-        { label: '2 tablets', text: '2 tablets' },
-        { label: '🤔 Not sure', text: 'not sure' },
-      ],
     },
     ask_med_time: {
       th: (name, dosage) => `${name}${dosage ? ` ${dosage}` : ''} — ทานตอนไหนครับ?`,
@@ -1431,38 +1413,64 @@ async function handleOnboarding(event, patient) {
     }
   }
 
-  // (B0) We asked how many tablets per dose for the pending med — this reply is it.
+  // (B-1) We asked for the medication's concentration/strength — this reply is it.
+  if (step === 'med_strength' && profile.pending_med) {
+    const pm = profile.pending_med;
+    if (info.done_listing_meds || info.no_medications || info.wants_edit || info.confirms_correct) {
+      // Bailed before giving a strength — drop the pending med, fall through.
+      profile.pending_med = null;
+      await pool.query(`UPDATE patients SET pending_med_name=NULL, pending_med_dosage=NULL WHERE id=$1`, [patientId]);
+    } else if (info.looks_like_medication) {
+      // They typed a different med instead of a strength → start that one fresh.
+      const med0 = medFromExtraction(info);
+      if (med0) { await startPendingMed(replyToken, patientId, profile, l, med0); return; }
+    } else {
+      // Resolve the strength: skip button → leave blank; a recognised value
+      // ("5mg","0.5%") or a short free-typed answer → store it.
+      let strength = null;
+      if (info.strength_value) strength = info.strength_value;
+      else if (!info.strength_skip && !info.dose_answered &&
+               /\d/.test(text) && text.trim().length <= 20) strength = text.trim();
+      if (strength) {
+        pm.dosageMg = strength;
+        pm.dosage = strength;
+        await pool.query(`UPDATE patients SET pending_med_dosage=$1 WHERE id=$2`, [strength, patientId]);
+      }
+      pm.stage = stageAfterStrength(pm);
+      // No count for this route (cream/injection) and time already known → save.
+      if (pm.stage === 'time' && pm.timeGiven && pm.schedule.length > 0) {
+        await finishPendingMed(replyToken, patientId, profile, l, pm.schedule);
+        return;
+      }
+      await client.replyMessage({ replyToken, messages: [pendingMedQuestion(l, pm)] });
+      return;
+    }
+  }
+
+  // (B0) We asked how many per dose for the pending med — this reply is it.
   if (step === 'med_dose' && profile.pending_med) {
     if (info.done_listing_meds || info.no_medications || info.wants_edit || info.confirms_correct) {
       // User bailed on this med before giving a dose — drop it, fall through.
       profile.pending_med = null;
       await pool.query(`UPDATE patients SET pending_med_name=NULL, pending_med_dosage=NULL WHERE id=$1`, [patientId]);
     } else {
-      // Resolve tablets-per-dose: button → info.dose_count; "not sure" → none;
-      // otherwise a short free-typed answer ("2", "ครึ่งเม็ด"). Ignore anything that
-      // looks like a new drug name so we don't store it as a dose.
-      let tablets = null;
-      if (typeof info.dose_count === 'string') tablets = info.dose_count;
+      // Resolve count-per-dose (tablets/drops/puffs): button → info.dose_count;
+      // "not sure" → none; otherwise a short free-typed answer. Ignore anything
+      // that looks like a new drug name so we don't store it as a dose.
+      let count = null;
+      if (typeof info.dose_count === 'string') count = info.dose_count;
       else if (!info.dose_answered && !info.looks_like_medication &&
-               text.trim().length > 0 && text.trim().length <= 20) tablets = text.trim();
+               text.trim().length > 0 && text.trim().length <= 20) count = text.trim();
       const pm = profile.pending_med;
-      pm.dosage = [pm.dosageMg, tablets].filter(Boolean).join(' · ') || null;
+      pm.dosage = [pm.dosageMg, count].filter(Boolean).join(' · ') || null;
       pm.stage = 'time';
       await pool.query(`UPDATE patients SET pending_med_dosage=$1 WHERE id=$2`, [pm.dosage, patientId]);
       if (pm.timeGiven && pm.schedule.length > 0) {
         // Time was already given with the name → nothing left to ask, save now.
-        const med = await saveMedicationToDB(patientId, pm.name, pm.dosage, pm.schedule);
-        profile.pending_med = null;
-        await pool.query(`UPDATE patients SET pending_med_name=NULL, pending_med_dosage=NULL WHERE id=$1`, [patientId]);
-        await client.replyMessage({ replyToken, messages: [buildQuickReply(
-          S(l, 'med_saved', formatMed(med, l)) + (l === 'en' ? 'Any others?' : 'มียาอีกไหมครับ?'),
-          S(l, 'more_med_buttons'))]});
+        await finishPendingMed(replyToken, patientId, profile, l, pm.schedule);
         return;
       }
-      await client.replyMessage({ replyToken, messages: [buildQuickReply(
-        S(l, 'ask_med_time', pm.name, pm.dosage),
-        l === 'en' ? TIME_BUTTONS_EN : TIME_BUTTONS
-      )]});
+      await client.replyMessage({ replyToken, messages: [pendingMedQuestion(l, pm)] });
       return;
     }
   }
@@ -1498,13 +1506,8 @@ async function handleOnboarding(event, patient) {
           if (restated && restated.schedule.length > 0) schedule = restated.schedule;
         }
         const finalSchedule = schedule.length > 0 ? schedule : ['08:00'];
-        const med = await saveMedicationToDB(patientId, profile.pending_med.name, profile.pending_med.dosage, finalSchedule);
-        profile.pending_med = null;
-        await pool.query(`UPDATE patients SET pending_med_name=NULL, pending_med_dosage=NULL WHERE id=$1`, [patientId]);
         await persistProfile(patientId, profile, lineUserId);
-        await client.replyMessage({ replyToken, messages: [buildQuickReply(
-          S(l, 'med_saved', formatMed(med, l)) + (l === 'en' ? 'Any other medications?' : 'มียาตัวอื่นอีกไหมครับ?'),
-          S(l, 'more_med_buttons'))]});
+        await finishPendingMed(replyToken, patientId, profile, l, finalSchedule);
         return;
       }
     }
@@ -1524,7 +1527,7 @@ async function handleOnboarding(event, patient) {
   // "meds area": a done/no-meds/photo signal can arrive even while a med was
   // pending its dose or time (we dropped that pending med just above), so all
   // three steps should honour them.
-  const inMedsArea = (step === 'medications' || step === 'med_dose' || step === 'med_time');
+  const inMedsArea = (step === 'medications' || step === 'med_strength' || step === 'med_dose' || step === 'med_time');
 
   // (C) No-medications declaration during the meds phase.
   if (inMedsArea && info.no_medications) {
@@ -1578,24 +1581,52 @@ async function handleOnboarding(event, patient) {
   await advanceOnboarding(replyToken, patient, profile);
 }
 
-// Stash a freshly-named medication as pending and ask how many tablets per dose.
-// Shared by the meds-listing flow, the confirm-screen "add another" path, and the
-// photo-label path so all three collect a dose (tablets) before asking the time.
-async function startPendingMed(replyToken, patientId, profile, l, med0) {
-  profile.pending_med = {
+// Stash a freshly-named medication as pending and ask the next thing we need.
+// Resolves route + food relation up front (curated table → LLM) so the dose
+// question is phrased per route. If the concentration (e.g. "5mg") wasn't given
+// in the name, we ask that first; otherwise we go straight to the per-dose count
+// (or, for creams/injections, the time). Shared by the meds-listing flow, the
+// confirm-screen "add another" path, and the photo-label path. `ackPrefix` lets
+// the photo flow prepend "อ่านได้ครับ 📷" to whatever question comes next.
+async function startPendingMed(replyToken, patientId, profile, l, med0, ackPrefix = '') {
+  const ref = await lookupMedReference(med0.name);   // { food_relation, route }, either may be null
+  const pm = {
     name: med0.name,
     dosageMg: med0.dosage || null,   // strength from the name, e.g. "5mg" (may be null)
-    dosage: med0.dosage || null,     // running display value; tablets get appended next turn
+    dosage: med0.dosage || null,     // running display value; count gets appended next turn
     schedule: med0.schedule || [],
     timeGiven: !!med0.timeGiven,
-    stage: 'dosage',
+    route: ref.route || null,
+    food_relation: ref.food_relation || null,
+    ref,
+    stage: null,
   };
+  pm.stage = pm.dosageMg ? stageAfterStrength(pm) : 'strength';
+  profile.pending_med = pm;
   await pool.query(`UPDATE patients SET pending_med_name=$1, pending_med_dosage=$2 WHERE id=$3`,
     [med0.name, med0.dosage || null, patientId]);
+
+  // Concentration in name + time already given + a route that takes no count →
+  // nothing left to ask, save immediately.
+  if (pm.stage === 'time' && pm.timeGiven && pm.schedule.length > 0) {
+    await finishPendingMed(replyToken, patientId, profile, l, pm.schedule);
+    return;
+  }
+  const msg = pendingMedQuestion(l, pm);
+  if (ackPrefix) msg.text = ackPrefix + msg.text;
+  await client.replyMessage({ replyToken, messages: [msg] });
+}
+
+// Save the pending med (passing the already-resolved route/food ref so we don't
+// look it up twice), clear pending state, and prompt for the next medication.
+async function finishPendingMed(replyToken, patientId, profile, l, schedule) {
+  const pm = profile.pending_med;
+  const med = await saveMedicationToDB(patientId, pm.name, pm.dosage, schedule, 'chat', pm.ref);
+  profile.pending_med = null;
+  await pool.query(`UPDATE patients SET pending_med_name=NULL, pending_med_dosage=NULL WHERE id=$1`, [patientId]);
   await client.replyMessage({ replyToken, messages: [buildQuickReply(
-    S(l, 'ask_med_dose', med0.name),
-    S(l, 'dose_buttons')
-  )]});
+    S(l, 'med_saved', formatMed(med, l)) + (l === 'en' ? 'Any other medications?' : 'มียาอีกไหมครับ?'),
+    S(l, 'more_med_buttons'))]});
 }
 
 // ------------------------------------------------------------
@@ -1677,20 +1708,12 @@ async function advanceOnboarding(target, patient, profile) {
       return;
     }
 
+    case 'med_strength':
     case 'med_dose':
-      // A med is pending its dose but we returned here without asking; ask now.
-      await respond([buildQuickReply(
-        S(l, 'ask_med_dose', profile.pending_med.name),
-        S(l, 'dose_buttons')
-      )]);
-      return;
-
     case 'med_time':
-      // We have a pending med but somehow returned here without asking; ask now.
-      await respond([buildQuickReply(
-        S(l, 'ask_med_time', profile.pending_med.name, profile.pending_med.dosage),
-        l === 'en' ? TIME_BUTTONS_EN : TIME_BUTTONS
-      )]);
+      // A med is pending one of its sub-steps but we returned here without asking;
+      // ask the right (route-aware) question for its current stage.
+      await respond([pendingMedQuestion(l, profile.pending_med)]);
       return;
 
     case 'medications': {
@@ -1809,19 +1832,13 @@ async function handleImageDuringOnboarding(event, patient) {
       await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: S(l, 'photo_ask_retake') }]});
       return;
     }
-    // Stash as a pending med and ask the dose (then the time) — same flow as text.
-    profile.pending_med = {
-      name, dosageMg: dosage || null, dosage: dosage || null,
-      schedule: [], timeGiven: false, stage: 'dosage',
-    };
+    // Funnel into the same pending-med flow as typed meds (route lookup, then
+    // strength-if-missing → count → time), with a photo ack on the next question.
     profile.meds_done = false;
     profile.confirmed = null;
-    await pool.query(`UPDATE patients SET pending_med_name=$1, pending_med_dosage=$2 WHERE id=$3`, [name, dosage || null, patientId]);
     const photoAck = l === 'en' ? 'Got it 📷 ' : 'อ่านได้ครับ 📷 ';
-    await client.replyMessage({ replyToken: event.replyToken, messages: [buildQuickReply(
-      photoAck + S(l, 'ask_med_dose', name + (dosage ? ` ${dosage}` : '')),
-      S(l, 'dose_buttons')
-    )]});
+    await startPendingMed(event.replyToken, patientId, profile, l,
+      { name, dosage: dosage || null, schedule: [], timeGiven: false }, photoAck);
   } catch (err) {
     console.error('Image onboarding error:', err.message);
     await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: S(profile.language || lang(patient), 'photo_ask_retake') }]});
@@ -2761,7 +2778,8 @@ async function buildDashboardCard(guardianLineUserId) {
     // guardian sees e.g. "ยาหยอดตา" / "พร้อมอาหาร" at a glance. Plain oral meds
     // fall back to a generic "💊 ยากิน" tag.
     const regimenRows = regimenResult.rows.map(m => {
-      const tag = [routeLabel(m.route, 'th'), foodLabel(m.food_relation, 'th')].filter(Boolean).join(' · ') || '💊 ยากิน';
+      const tag = [routeLabel(m.route, 'th'), foodLabel(m.food_relation, 'th')].filter(Boolean).join(' · ')
+        || (m.route === 'po' ? '💊 ยากิน' : '💊 ยา');
       return {
         type: 'box', layout: 'horizontal',
         contents: [
