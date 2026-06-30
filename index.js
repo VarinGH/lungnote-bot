@@ -60,6 +60,14 @@ pool.query('SELECT NOW()')
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_medref_trgm ON medications_reference USING gin (name_canonical gin_trgm_ops)`);
     await pool.query(`ALTER TABLE medications ADD COLUMN IF NOT EXISTS food_relation TEXT DEFAULT 'after_meal'`);
     await pool.query(`ALTER TABLE medications ADD COLUMN IF NOT EXISTS route TEXT DEFAULT 'po'`);
+    // Provenance + nullable values for auto-cached LLM verdicts: 'curated' rows
+    // are clinician-authored seeds; 'llm' rows are model guesses awaiting review
+    // (query `WHERE source='llm'`). Drop NOT NULL so an LLM row can store a blank
+    // food_relation/route when the model wasn't confident.
+    await pool.query(`ALTER TABLE medications_reference ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'curated'`);
+    await pool.query(`ALTER TABLE medications_reference ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`);
+    await pool.query(`ALTER TABLE medications_reference ALTER COLUMN food_relation DROP NOT NULL`);
+    await pool.query(`ALTER TABLE medications_reference ALTER COLUMN route DROP NOT NULL`);
     await seedMedicationsReference();
     console.log('✅ medications_reference ready');
   } catch (err) {
@@ -308,14 +316,16 @@ function routeLabel(route, l = 'th') { return (ROUTE_LABELS[l] || ROUTE_LABELS.t
 const REF_ROUTES = new Set(['po','eye_drop','ear_drop','inhaler','nasal','topical','sublingual','injection']);
 const REF_FOODS  = new Set(['before_meal','after_meal','with_food','any']);
 
-// Ask Sonnet to classify a drug we don't have in the curated table. Returns
+// Ask the LLM to classify a drug we don't have in the curated table. Returns
 // route + food_relation, but ONLY values it is confident about — anything
 // uncertain comes back null so we store a blank rather than a wrong guess
 // (per clinical preference: blank > wrong "after_meal"/"po"). Never throws.
+// Haiku is used: benchmarked equal to Sonnet on route (the field that drives the
+// reminder verb) at ~25% lower latency and far lower cost.
 async function classifyMedWithLLM(name) {
   try {
     const r = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
+      model: 'claude-haiku-4-5-20251001',
       max_tokens: 120,
       system: 'You are a clinical pharmacology assistant for a Thai elderly-care app. Given a medication or product name (Thai or English, possibly a brand or eye-lubricant), classify how it is administered and its meal relation. Reply with ONLY JSON, no prose.',
       messages: [{ role: 'user', content:
@@ -343,8 +353,9 @@ async function classifyMedWithLLM(name) {
 
 // Resolve a drug's food relation + administration route. Curated reference table
 // first (alias match or pg_trgm fuzzy on the canonical name); on a miss, fall
-// back to the LLM classifier. Either field may come back null when unknown — we
-// deliberately do NOT default to 'after_meal'/'po'. Never throws.
+// back to the LLM classifier and cache its verdict so the next patient on the
+// same drug skips the LLM call. Either field may come back null when unknown —
+// we deliberately do NOT default to 'after_meal'/'po'. Never throws.
 async function lookupMedReference(name) {
   if (!name) return { food_relation: null, route: null };
   try {
@@ -359,8 +370,32 @@ async function lookupMedReference(name) {
   } catch (err) {
     console.error('lookupMedReference table query failed:', err.message);
   }
-  // Not curated → ask the model (which returns null for anything uncertain).
-  return await classifyMedWithLLM(name);
+  // Not curated → ask the model (which returns null for anything uncertain),
+  // then persist the verdict as an 'llm' row for review + reuse.
+  const verdict = await classifyMedWithLLM(name);
+  await cacheMedReference(name, verdict);
+  return verdict;
+}
+
+// Persist an LLM verdict into medications_reference as a 'source=llm' row so the
+// next lookup of the same drug hits the table instead of the model, and so a
+// clinician can review/correct it later (`WHERE source='llm'`). Only caches when
+// something was actually learned; ON CONFLICT keeps any existing/curated row.
+// Never throws — a cache failure must not block saving the medication.
+async function cacheMedReference(name, verdict) {
+  if (!verdict || (!verdict.route && !verdict.food_relation)) return;
+  const canonical = name.trim();
+  try {
+    await pool.query(
+      `INSERT INTO medications_reference (name_canonical, name_aliases, food_relation, route, source)
+       VALUES ($1, $2, $3, $4, 'llm')
+       ON CONFLICT (name_canonical) DO NOTHING`,
+      [canonical, [canonical.toLowerCase()], verdict.food_relation, verdict.route]
+    );
+    console.log(`🗃 Cached LLM verdict "${canonical}" → route=${verdict.route ?? '∅'}, food=${verdict.food_relation ?? '∅'}`);
+  } catch (err) {
+    console.error('cacheMedReference failed:', err.message);
+  }
 }
 
 function formatMed(med, l = 'th') {

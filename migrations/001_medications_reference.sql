@@ -10,15 +10,24 @@ CREATE TABLE IF NOT EXISTS medications_reference (
   id             SERIAL PRIMARY KEY,
   name_canonical TEXT NOT NULL UNIQUE,
   name_aliases   TEXT[] DEFAULT '{}',
-  food_relation  TEXT NOT NULL DEFAULT 'after_meal',
-    -- 'before_meal' | 'after_meal' | 'with_food' | 'any'
-  route          TEXT NOT NULL DEFAULT 'po',
-    -- 'po' | 'eye_drop' | 'ear_drop' | 'inhaler' | 'nasal' | 'topical' | 'sublingual' | 'injection'
-  common_doses   TEXT[] DEFAULT '{}'
+  food_relation  TEXT,   -- before_meal | after_meal | with_food | any | NULL(unknown)
+  route          TEXT,   -- po | eye_drop | ear_drop | inhaler | nasal | topical | sublingual | injection | NULL(unknown)
+  common_doses   TEXT[] DEFAULT '{}',
+  source         TEXT DEFAULT 'curated',   -- 'curated' (clinician seed) | 'llm' (auto-cached, review)
+  created_at     TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_medref_trgm ON medications_reference
   USING gin (name_canonical gin_trgm_ops);
 
+-- For an existing table created by an earlier version of this migration where
+-- food_relation/route were NOT NULL: relax them so LLM rows can store blanks.
+ALTER TABLE medications_reference ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'curated';
+ALTER TABLE medications_reference ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
+ALTER TABLE medications_reference ALTER COLUMN food_relation DROP NOT NULL;
+ALTER TABLE medications_reference ALTER COLUMN route DROP NOT NULL;
+
 ALTER TABLE medications ADD COLUMN IF NOT EXISTS food_relation TEXT DEFAULT 'after_meal';
 ALTER TABLE medications ADD COLUMN IF NOT EXISTS route TEXT DEFAULT 'po';
+
+-- Review auto-cached LLM verdicts:  SELECT * FROM medications_reference WHERE source='llm';
