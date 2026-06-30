@@ -27,6 +27,71 @@ pool.query(`ALTER TABLE invite_tokens ADD COLUMN IF NOT EXISTS nudge_sent BOOLEA
   .then(() => console.log('✅ invite_tokens.nudge_sent ready'))
   .catch(err => console.error('❌ nudge_sent migration failed:', err.message));
 
+// Idempotent startup migration — medications reference table + per-med
+// food_relation / route. Lets saveMedicationToDB auto-look up how each drug is
+// taken (oral, eye drop, etc.) and its meal relation, so we never ask the user
+// "before/after meal" and reminders use the right verb. Mirrors the same boot-
+// time IF NOT EXISTS pattern above; safe on every deploy.
+(async () => {
+  try {
+    await pool.query(`CREATE EXTENSION IF NOT EXISTS pg_trgm`);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS medications_reference (
+        id             SERIAL PRIMARY KEY,
+        name_canonical TEXT NOT NULL UNIQUE,
+        name_aliases   TEXT[] DEFAULT '{}',
+        food_relation  TEXT NOT NULL DEFAULT 'after_meal',  -- before_meal | after_meal | with_food | any
+        route          TEXT NOT NULL DEFAULT 'po',          -- po | eye_drop | ear_drop | inhaler | nasal | topical | sublingual | injection
+        common_doses   TEXT[] DEFAULT '{}'
+      )`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_medref_trgm ON medications_reference USING gin (name_canonical gin_trgm_ops)`);
+    await pool.query(`ALTER TABLE medications ADD COLUMN IF NOT EXISTS food_relation TEXT DEFAULT 'after_meal'`);
+    await pool.query(`ALTER TABLE medications ADD COLUMN IF NOT EXISTS route TEXT DEFAULT 'po'`);
+    await seedMedicationsReference();
+    console.log('✅ medications_reference ready');
+  } catch (err) {
+    console.error('❌ medications_reference migration failed:', err.message);
+  }
+})();
+
+// Seed ~common Thai HTN/DM/lipid meds plus a few non-oral examples (eye drops,
+// inhaler) so route handling is exercised. ON CONFLICT DO NOTHING keeps any
+// clinician-edited rows intact across deploys — we only fill gaps, never clobber.
+async function seedMedicationsReference() {
+  const SEED = [
+    // name_canonical, aliases, food_relation, route, common_doses
+    ['Amlodipine', ['norvasc','แอมโลดิปีน'], 'any', 'po', ['2.5mg','5mg','10mg']],
+    ['Enalapril', ['renitec','อีนาลาพริล'], 'any', 'po', ['5mg','10mg','20mg']],
+    ['Losartan', ['cozaar','โลซาร์แทน'], 'any', 'po', ['50mg','100mg']],
+    ['Atenolol', ['tenormin','อะทีโนลอล'], 'any', 'po', ['25mg','50mg','100mg']],
+    ['Hydrochlorothiazide', ['hctz','ไฮโดรคลอโรไทอาไซด์'], 'any', 'po', ['25mg','50mg']],
+    ['Furosemide', ['lasix','ฟูโรซีไมด์'], 'any', 'po', ['20mg','40mg']],
+    ['Metformin', ['glucophage','เมทฟอร์มิน'], 'with_food', 'po', ['500mg','850mg','1000mg']],
+    ['Glipizide', ['minidiab','กลิพิไซด์'], 'before_meal', 'po', ['5mg','10mg']],
+    ['Glibenclamide', ['glyburide','daonil','ไกลเบนคลาไมด์'], 'before_meal', 'po', ['5mg']],
+    ['Sitagliptin', ['januvia','ซิทากลิปติน'], 'any', 'po', ['50mg','100mg']],
+    ['Atorvastatin', ['lipitor','อะทอร์วาสแตติน'], 'any', 'po', ['10mg','20mg','40mg']],
+    ['Simvastatin', ['zocor','ซิมวาสแตติน'], 'any', 'po', ['10mg','20mg','40mg']],
+    ['Aspirin', ['asa','aspent','แอสไพริน'], 'after_meal', 'po', ['81mg','100mg']],
+    ['Omeprazole', ['losec','โอเมพราโซล'], 'before_meal', 'po', ['20mg','40mg']],
+    ['Prednisolone', ['เพรดนิโซโลน'], 'after_meal', 'po', ['5mg']],
+    ['Warfarin', ['orfarin','วาร์ฟาริน'], 'any', 'po', ['2mg','3mg','5mg']],
+    // --- non-oral examples (route demonstration) ---
+    ['Timolol eye drops', ['timoptol','ทิโมลอล'], 'any', 'eye_drop', ['0.25%','0.5%']],
+    ['Latanoprost eye drops', ['xalatan','ลาทานోพรอสต์'], 'any', 'eye_drop', ['0.005%']],
+    ['Artificial tears', ['น้ำตาเทียม','systane'], 'any', 'eye_drop', []],
+    ['Salbutamol inhaler', ['ventolin','ซัลบูทามอล','ยาพ่น'], 'any', 'inhaler', []],
+  ];
+  for (const [name, aliases, food, route, doses] of SEED) {
+    await pool.query(
+      `INSERT INTO medications_reference (name_canonical, name_aliases, food_relation, route, common_doses)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (name_canonical) DO NOTHING`,
+      [name, aliases, food, route, doses]
+    );
+  }
+}
+
 const lineConfig = {
   channelSecret: process.env.LINE_CHANNEL_SECRET,
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
@@ -62,6 +127,7 @@ const SYSTEM_PROMPT = `
 - พูดอบอุ่น กระชับ ไม่เกิน 3 บรรทัดต่อการตอบ
 - ลงท้ายด้วย "ครับ" เสมอ
 - เมื่อเตือนยา ให้บอกชื่อยาและขนาดยาด้วย
+- ในรายการยาด้านล่าง วงเล็บ [ ] บอกวิธีใช้และความสัมพันธ์กับอาหาร เช่น ยาหยอดตา/ยาพ่น/พร้อมอาหาร/ก่อนอาหาร — ให้ใช้คำให้ถูกวิธี (ยาหยอดตาให้พูดว่า "หยอด" ไม่ใช่ "กิน") และถ้าผู้ใช้ถามให้บอกตามนี้ ห้ามเดาเอง
 - หากค่าใดผิดปกติ ให้แนะนำพบแพทย์ด้วยความห่วงใย แต่ห้ามบอกว่าเป็นโรคอะไร หรือวินิจฉัยอาการ
 - รับข้อมูลทั้งภาษาไทยและตัวเลข เช่น "130/85" หรือ "กินยาแล้ว"
 - เมื่อผู้ใช้ส่งรูปมา ให้อ่านค่าอย่างระมัดระวัง แล้วทวนให้ผู้ใช้ยืนยันก่อนเสมอ
@@ -199,19 +265,68 @@ function normalizeMealTimes(mt) {
   };
 }
 
-function formatMed(med) {
+// ── Medication food-relation + route labels ────────────────────────────────
+// food_relation: when to take relative to meals. route: how it's administered,
+// which decides the reminder verb ("take" vs "instill eye drops") so we remind
+// the right way per drug. Both are looked up from medications_reference at save
+// time — the user is never asked.
+const FOOD_LABELS = {
+  th: { before_meal:'🕐 ก่อนอาหาร', after_meal:'🍽 หลังอาหาร', with_food:'🍽 พร้อมอาหาร', any:'⏱ เมื่อไรก็ได้' },
+  en: { before_meal:'🕐 Before meal', after_meal:'🍽 After meal', with_food:'🍽 With food', any:'⏱ Anytime' },
+};
+function foodLabel(rel, l = 'th') { return (FOOD_LABELS[l] || FOOD_LABELS.th)[rel] || ''; }
+
+// Verb used in the reminder push, e.g. "ถึงเวลา<กินยา>แล้ว" / "Time to <take>".
+const ROUTE_VERBS = {
+  th: { po:'กินยา', eye_drop:'หยอดตา', ear_drop:'หยอดหู', inhaler:'พ่นยา', nasal:'พ่นจมูก', topical:'ทายา', sublingual:'อมยาใต้ลิ้น', injection:'ฉีดยา' },
+  en: { po:'take your medicine', eye_drop:'use your eye drops', ear_drop:'use your ear drops', inhaler:'use your inhaler', nasal:'use your nasal spray', topical:'apply your medicine', sublingual:'take your sublingual tablet', injection:'take your injection' },
+};
+function routeVerb(route, l = 'th') { const m = ROUTE_VERBS[l] || ROUTE_VERBS.th; return m[route] || m.po; }
+
+// Short label shown on the med card; '' for plain oral so cards stay uncluttered.
+const ROUTE_LABELS = {
+  th: { eye_drop:'👁 ยาหยอดตา', ear_drop:'👂 ยาหยอดหู', inhaler:'🌬 ยาพ่น', nasal:'👃 ยาพ่นจมูก', topical:'🧴 ยาทา', sublingual:'💊 ยาอมใต้ลิ้น', injection:'💉 ยาฉีด' },
+  en: { eye_drop:'👁 Eye drops', ear_drop:'👂 Ear drops', inhaler:'🌬 Inhaler', nasal:'👃 Nasal spray', topical:'🧴 Topical', sublingual:'💊 Sublingual', injection:'💉 Injection' },
+};
+function routeLabel(route, l = 'th') { return (ROUTE_LABELS[l] || ROUTE_LABELS.th)[route] || ''; }
+
+// Look up a drug's food relation + administration route from the reference
+// table. Matches an alias exactly (case-insensitive) or fuzzily on the
+// canonical name via pg_trgm similarity. Unknown drugs default to oral /
+// after-meal so a reminder is never blocked. Never throws — falls back on error.
+async function lookupMedReference(name) {
+  const fallback = { food_relation: 'after_meal', route: 'po' };
+  if (!name) return fallback;
+  try {
+    const r = await pool.query(`
+      SELECT food_relation, route FROM medications_reference
+      WHERE $1 ILIKE ANY(name_aliases)
+         OR similarity(name_canonical, $1) > 0.45
+      ORDER BY similarity(name_canonical, $1) DESC
+      LIMIT 1
+    `, [name.trim().toLowerCase()]);
+    return r.rows[0] || fallback;
+  } catch (err) {
+    console.error('lookupMedReference failed:', err.message);
+    return fallback;
+  }
+}
+
+function formatMed(med, l = 'th') {
   const times = med.schedule.map(t => TIME_LABELS[t] || t).join(', ');
-  return `${med.name}${med.dosage ? ` ${med.dosage}` : ''} — ${times}`;
+  const food = foodLabel(med.food_relation, l);
+  return `${med.name}${med.dosage ? ` ${med.dosage}` : ''} — ${times}${food ? ` (${food})` : ''}`;
 }
 
 async function saveMedicationToDB(patientId, name, dosage, schedule, source = 'chat') {
+  const { food_relation, route } = await lookupMedReference(name);
   const result = await pool.query(
-    `INSERT INTO medications (patient_id, name, dosage, schedule, active, source)
-     VALUES ($1, $2, $3, $4, TRUE, $5)
-     RETURNING id, name, dosage, schedule`,
-    [patientId, name, dosage, schedule, source]
+    `INSERT INTO medications (patient_id, name, dosage, schedule, food_relation, route, active, source)
+     VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7)
+     RETURNING id, name, dosage, schedule, food_relation, route`,
+    [patientId, name, dosage, schedule, food_relation, route, source]
   );
-  console.log(`💊 Saved: ${name} @ ${schedule.join(', ')}`);
+  console.log(`💊 Saved: ${name} @ ${schedule.join(', ')} (${route}, ${food_relation})`);
   return result.rows[0];
 }
 
@@ -219,21 +334,27 @@ async function saveMedicationToDB(patientId, name, dosage, schedule, source = 'c
 // FLEX MESSAGE: MEDICATION CARD
 // ============================================================
 
-async function buildMedCard(patientId, headerText = '💊 รายการยาของคุณ') {
+async function buildMedCard(patientId, headerText = '💊 รายการยาของคุณ', l = 'th') {
   const result = await pool.query(
-    `SELECT name, dosage, schedule FROM medications
+    `SELECT name, dosage, schedule, food_relation, route FROM medications
      WHERE patient_id = $1 AND active = TRUE ORDER BY created_at`,
     [patientId]
   );
 
-  const rows = result.rows.map(m => ({
-    type: 'box', layout: 'horizontal',
-    contents: [
-      { type: 'text', text: `${m.name}${m.dosage ? ` ${m.dosage}` : ''}`, size: 'sm', color: '#1a1a1a', flex: 3, wrap: true },
-      { type: 'text', text: m.schedule.map(t => TIME_LABELS[t] || t).join(', '), size: 'sm', color: '#555555', flex: 2, align: 'end', wrap: true },
-    ],
-    paddingTop: '8px', paddingBottom: '8px',
-  }));
+  const rows = result.rows.map(m => {
+    // Muted sub-line: route tag (only when not plain oral) + food relation,
+    // e.g. "👁 ยาหยอดตา · ⏱ เมื่อไรก็ได้" or just "🍽 พร้อมอาหาร".
+    const sub = [routeLabel(m.route, l), foodLabel(m.food_relation, l)].filter(Boolean).join(' · ');
+    const lines = [{
+      type: 'box', layout: 'horizontal',
+      contents: [
+        { type: 'text', text: `${m.name}${m.dosage ? ` ${m.dosage}` : ''}`, size: 'sm', color: '#1a1a1a', flex: 3, wrap: true },
+        { type: 'text', text: m.schedule.map(t => TIME_LABELS[t] || t).join(', '), size: 'sm', color: '#555555', flex: 2, align: 'end', wrap: true },
+      ],
+    }];
+    if (sub) lines.push({ type: 'text', text: sub, size: 'xxs', color: '#888888', wrap: true });
+    return { type: 'box', layout: 'vertical', spacing: 'none', contents: lines, paddingTop: '8px', paddingBottom: '8px' };
+  });
 
   return {
     type: 'flex',
@@ -611,13 +732,15 @@ const S = (lang, key, ...args) => {
       en: (name, dosage) => `Got it! 📷\n${name}${dosage ? ` ${dosage}` : ''} — when do you take it?`,
     },
     // Cron pushes
+    // route drives the verb ("กินยา" vs "หยอดตา" / "take" vs "use eye drops");
+    // food shows the meal relation hint when known. Both default to oral/none.
     reminder_push: {
-      th: (name, med, dosage) => `💊 ถึงเวลากินยาแล้ว${name}ครับ\nยา: ${med}${dosage ? ` ${dosage}` : ''}\nกินเสร็จแล้วตอบ "กินแล้ว" ให้ลุงทราบด้วยนะครับ 🙏`,
-      en: (name, med, dosage) => `💊 Time for your medication${name}!\nMed: ${med}${dosage ? ` ${dosage}` : ''}\nReply "taken" when done 🙏`,
+      th: (name, med, dosage, route, food) => `💊 ถึงเวลา${routeVerb(route, 'th')}แล้ว${name}ครับ\nยา: ${med}${dosage ? ` ${dosage}` : ''}${food ? `\n${foodLabel(food, 'th')}` : ''}\nเสร็จแล้วตอบ "กินแล้ว" ให้ลุงทราบด้วยนะครับ 🙏`,
+      en: (name, med, dosage, route, food) => `💊 Time to ${routeVerb(route, 'en')}${name}!\nMed: ${med}${dosage ? ` ${dosage}` : ''}${food ? `\n${foodLabel(food, 'en')}` : ''}\nReply "taken" when done 🙏`,
     },
     followup_push: {
-      th: (name, med, dosage) => `🔔 ลุงโน้ตเป็นห่วงนะครับ${name}\nยัง${med}${dosage ? ` ${dosage}` : ''} ยังไม่ได้กินใช่ไหมครับ?\nถ้ากินแล้วตอบ "กินแล้ว" ได้เลยครับ 💊`,
-      en: (name, med, dosage) => `🔔 Just checking in${name}\nHave you taken ${med}${dosage ? ` ${dosage}` : ''} yet?\nReply "taken" if you have 💊`,
+      th: (name, med, dosage, route) => `🔔 ลุงโน้ตเป็นห่วงนะครับ${name}\n${med}${dosage ? ` ${dosage}` : ''} ยังไม่ได้${routeVerb(route, 'th')}ใช่ไหมครับ?\nถ้าเสร็จแล้วตอบ "กินแล้ว" ได้เลยครับ 💊`,
+      en: (name, med, dosage, route) => `🔔 Just checking in${name}\nHave you had time to ${routeVerb(route, 'en')} (${med}${dosage ? ` ${dosage}` : ''}) yet?\nReply "taken" if you have 💊`,
     },
     refill_push: {
       th: (name, med, dosage, days) => `⚠️ ยา${med}${dosage ? ` ${dosage}` : ''} ใกล้หมดแล้วครับ${name}\nเหลืออยู่ประมาณ ${days} วันครับ\nอย่าลืมขอยาเพิ่มจากแพทย์ด้วยนะครับ 🏥`,
@@ -1209,7 +1332,7 @@ async function handleOnboarding(event, patient) {
         profile.pending_med = null;
         await pool.query(`UPDATE patients SET pending_med_name=NULL, pending_med_dosage=NULL WHERE id=$1`, [patientId]);
         await client.replyMessage({ replyToken, messages: [buildQuickReply(
-          S(l, 'med_saved', formatMed(med)) + (l === 'en' ? 'Any others?' : 'มียาอีกไหมครับ?'),
+          S(l, 'med_saved', formatMed(med, l)) + (l === 'en' ? 'Any others?' : 'มียาอีกไหมครับ?'),
           S(l, 'more_med_buttons'))]});
         return;
       }
@@ -1257,7 +1380,7 @@ async function handleOnboarding(event, patient) {
         await pool.query(`UPDATE patients SET pending_med_name=NULL, pending_med_dosage=NULL WHERE id=$1`, [patientId]);
         await persistProfile(patientId, profile, lineUserId);
         await client.replyMessage({ replyToken, messages: [buildQuickReply(
-          S(l, 'med_saved', formatMed(med)) + (l === 'en' ? 'Any other medications?' : 'มียาตัวอื่นอีกไหมครับ?'),
+          S(l, 'med_saved', formatMed(med, l)) + (l === 'en' ? 'Any other medications?' : 'มียาตัวอื่นอีกไหมครับ?'),
           S(l, 'more_med_buttons'))]});
         return;
       }
@@ -1466,7 +1589,7 @@ async function advanceOnboarding(target, patient, profile) {
       const header = profile.care_mode === 'family'
         ? (l === 'en' ? `💊 ${profile.patient_name || 'Parent'}'s medications` : `💊 ยาของคุณ${profile.patient_name || 'ท่าน'}`)
         : (l === 'en' ? '💊 Your medications' : '💊 รายการยาที่ลุงจดไว้');
-      const card = await buildMedCard(patientId, header);
+      const card = await buildMedCard(patientId, header, l);
       const nameForConfirm = profile.care_mode === 'family' ? (profile.patient_name || '') : (profile.self_name || '');
       await respond([
         card,
@@ -1589,22 +1712,27 @@ async function handleImageDuringOnboarding(event, patient) {
 const medCache = new Map();
 const CACHE_TTL = 5 * 60 * 1000;
 
-async function loadPatientContext(patientId) {
+async function loadPatientContext(patientId, language = 'th') {
   const cached = medCache.get(patientId);
   if (cached && Date.now() - cached.loadedAt < CACHE_TTL) return cached.context;
 
   const result = await pool.query(
-    `SELECT name, dosage, schedule FROM medications WHERE patient_id = $1 AND active = TRUE ORDER BY created_at`,
+    `SELECT name, dosage, schedule, food_relation, route FROM medications WHERE patient_id = $1 AND active = TRUE ORDER BY created_at`,
     [patientId]
   );
   if (result.rows.length === 0) { medCache.set(patientId, { context: '', loadedAt: Date.now() }); return ''; }
 
+  // [route · food relation] tag lets the model use the right verb (instil vs take)
+  // and answer meal-timing questions without guessing. routeLabel is '' for plain
+  // oral, so those meds show only the food relation (or nothing).
   const list = result.rows.map(m => {
     const times = m.schedule.map(t => TIME_LABELS[t] || t).join(', ');
-    return `- ${m.name}${m.dosage ? ` ${m.dosage}` : ''} (${times})`;
+    const tags = [routeLabel(m.route, language), foodLabel(m.food_relation, language)].filter(Boolean).join(' · ');
+    return `- ${m.name}${m.dosage ? ` ${m.dosage}` : ''} (${times})${tags ? ` [${tags}]` : ''}`;
   }).join('\n');
 
-  const context = `\n\nยาที่ผู้ใช้ทานประจำ:\n${list}`;
+  const header = language === 'en' ? "User's regular medications:" : 'ยาที่ผู้ใช้ทานประจำ:';
+  const context = `\n\n${header}\n${list}`;
   medCache.set(patientId, { context, loadedAt: Date.now() });
   return context;
 }
@@ -1615,7 +1743,7 @@ async function buildSystemPrompt(patientId) {
   const langInstruction = language === 'en'
     ? '\n\nIMPORTANT: This user speaks English. Always reply in English. Keep the same warm, concise style. End replies naturally in English.'
     : '';
-  return SYSTEM_PROMPT + langInstruction + (await loadPatientContext(patientId));
+  return SYSTEM_PROMPT + langInstruction + (await loadPatientContext(patientId, language));
 }
 
 // ============================================================
@@ -1954,7 +2082,7 @@ async function getMedicationsDue() {
   // We compare the patient's personal times to the current clock time,
   // then check if the corresponding anchor slot is in the medication's schedule.
   const result = await pool.query(
-    `SELECT m.id as medication_id, m.name, m.dosage, m.schedule,
+    `SELECT m.id as medication_id, m.name, m.dosage, m.schedule, m.route, m.food_relation,
             p.id as patient_id, p.line_user_id, p.display_name, p.language,
             p.meal_morning, p.meal_midday, p.meal_evening, p.meal_bedtime
      FROM medications m JOIN patients p ON p.id=m.patient_id
@@ -1980,7 +2108,7 @@ cron.schedule('* * * * *', async () => {
         const l = med.language === 'en' ? 'en' : 'th';
         const name = med.display_name ? (l === 'en' ? ` ${med.display_name}` : ` คุณ${med.display_name}`) : '';
         await client.pushMessage({ to: med.line_user_id, messages: [{ type: 'text',
-          text: S(l, 'reminder_push', name, med.name, med.dosage) }]});
+          text: S(l, 'reminder_push', name, med.name, med.dosage, med.route, med.food_relation) }]});
         await pool.query(`INSERT INTO medication_logs (medication_id, patient_id, status, scheduled_at) VALUES ($1,$2,'missed',$3)`, [med.medication_id, med.patient_id, new Date()]);
         console.log(`✅ Reminder: ${med.name} → ${med.line_user_id}`);
       } catch (err) { console.error(`❌ Reminder failed ${med.name}:`, err.message); }
@@ -2090,7 +2218,7 @@ cron.schedule('*/5 * * * *', async () => {
     // --- 30 min follow-up: still 'missed', no follow-up sent yet ---
     const needsFollowUp = await pool.query(
       `SELECT ml.id, ml.medication_id, ml.patient_id, ml.scheduled_at,
-              m.name, m.dosage,
+              m.name, m.dosage, m.route,
               p.line_user_id, p.display_name, p.language
        FROM medication_logs ml
        JOIN medications m ON m.id = ml.medication_id
@@ -2109,7 +2237,7 @@ cron.schedule('*/5 * * * *', async () => {
         const name = row.display_name ? (l === 'en' ? ` ${row.display_name}` : ` คุณ${row.display_name}`) : '';
         await client.pushMessage({
           to: row.line_user_id,
-          messages: [{ type: 'text', text: S(l, 'followup_push', name, row.name, row.dosage) }],
+          messages: [{ type: 'text', text: S(l, 'followup_push', name, row.name, row.dosage, row.route) }],
         });
         await pool.query(`UPDATE medication_logs SET followup_sent=TRUE WHERE id=$1`, [row.id]);
         console.log(`🔔 Follow-up sent: ${row.name} → ${row.line_user_id}`);
@@ -2445,7 +2573,7 @@ async function buildDashboardCard(guardianLineUserId) {
     const name = patient.display_name || 'ผู้ป่วย';
 
     // ── Single query: snapshot + today's prose summary ──────
-    const [snapResult, summaryResult] = await Promise.all([
+    const [snapResult, summaryResult, regimenResult] = await Promise.all([
       pool.query(
         `SELECT vitals, meds_today, urgent_count, last_updated
          FROM patient_snapshots WHERE patient_id=$1`,
@@ -2455,6 +2583,11 @@ async function buildDashboardCard(guardianLineUserId) {
         `SELECT summary_text, generated_at FROM daily_summaries
          WHERE patient_id=$1 AND summary_date=$2`,
         [patient.id, bangkokToday]
+      ),
+      pool.query(
+        `SELECT name, dosage, food_relation, route FROM medications
+         WHERE patient_id=$1 AND active=TRUE ORDER BY created_at`,
+        [patient.id]
       ),
     ]);
 
@@ -2501,6 +2634,21 @@ async function buildDashboardCard(guardianLineUserId) {
       paddingTop: '6px', paddingBottom: '6px',
     };
 
+    // Regimen list with how each med is taken (route) + meal relation, so the
+    // guardian sees e.g. "ยาหยอดตา" / "พร้อมอาหาร" at a glance. Plain oral meds
+    // fall back to a generic "💊 ยากิน" tag.
+    const regimenRows = regimenResult.rows.map(m => {
+      const tag = [routeLabel(m.route, 'th'), foodLabel(m.food_relation, 'th')].filter(Boolean).join(' · ') || '💊 ยากิน';
+      return {
+        type: 'box', layout: 'horizontal',
+        contents: [
+          { type: 'text', text: `${m.name}${m.dosage ? ` ${m.dosage}` : ''}`, size: 'xs', color: '#555555', flex: 4, wrap: true },
+          { type: 'text', text: tag, size: 'xxs', color: '#999999', flex: 5, align: 'end', wrap: true },
+        ],
+        paddingTop: '2px', paddingBottom: '2px',
+      };
+    });
+
     const summaryText = summaryResult.rows.length > 0
       ? summaryResult.rows[0].summary_text
       : 'ยังไม่มีสรุปวันนี้ครับ (จะสรุปเวลา 20:00 น.)';
@@ -2528,6 +2676,10 @@ async function buildDashboardCard(guardianLineUserId) {
             { type: 'separator', margin: 'md' },
           ]),
           medRow,
+          ...(regimenRows.length > 0 ? [
+            { type: 'text', text: '💊 ยาประจำ', size: 'xs', color: '#888888', weight: 'bold', margin: 'md' },
+            ...regimenRows,
+          ] : []),
           { type: 'separator', margin: 'md' },
           { type: 'text', text: '💬 สรุปวันนี้', size: 'xs', color: '#888888', weight: 'bold', margin: 'md' },
           { type: 'text', text: summaryText, size: 'sm', color: '#333333', wrap: true, margin: 'sm' },
@@ -3167,7 +3319,9 @@ async function handleTextMessage(event, patientId) {
 
   // ── check_med_list ─────────────────────────────────────────
   if (intent === 'check_med_list') {
-    const card = await buildMedCard(patientId, '💊 รายการยาของคุณ');
+    const patient = await getOrCreatePatient(lineUserId);
+    const l = lang(patient);
+    const card = await buildMedCard(patientId, l === 'en' ? '💊 Your medications' : '💊 รายการยาของคุณ', l);
     await client.replyMessage({ replyToken: event.replyToken, messages: [card] });
     await incrementQuota(patientId, 'message');
     return;
