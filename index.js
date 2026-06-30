@@ -290,11 +290,13 @@ const FOOD_LABELS = {
 function foodLabel(rel, l = 'th') { return (FOOD_LABELS[l] || FOOD_LABELS.th)[rel] || ''; }
 
 // Verb used in the reminder push, e.g. "ถึงเวลา<กินยา>แล้ว" / "Time to <take>".
+// `unknown` is the neutral fallback when route couldn't be determined — we say
+// "use your medicine" rather than wrongly assuming it's swallowed.
 const ROUTE_VERBS = {
-  th: { po:'กินยา', eye_drop:'หยอดตา', ear_drop:'หยอดหู', inhaler:'พ่นยา', nasal:'พ่นจมูก', topical:'ทายา', sublingual:'อมยาใต้ลิ้น', injection:'ฉีดยา' },
-  en: { po:'take your medicine', eye_drop:'use your eye drops', ear_drop:'use your ear drops', inhaler:'use your inhaler', nasal:'use your nasal spray', topical:'apply your medicine', sublingual:'take your sublingual tablet', injection:'take your injection' },
+  th: { po:'กินยา', eye_drop:'หยอดตา', ear_drop:'หยอดหู', inhaler:'พ่นยา', nasal:'พ่นจมูก', topical:'ทายา', sublingual:'อมยาใต้ลิ้น', injection:'ฉีดยา', unknown:'ใช้ยา' },
+  en: { po:'take your medicine', eye_drop:'use your eye drops', ear_drop:'use your ear drops', inhaler:'use your inhaler', nasal:'use your nasal spray', topical:'apply your medicine', sublingual:'take your sublingual tablet', injection:'take your injection', unknown:'use your medicine' },
 };
-function routeVerb(route, l = 'th') { const m = ROUTE_VERBS[l] || ROUTE_VERBS.th; return m[route] || m.po; }
+function routeVerb(route, l = 'th') { const m = ROUTE_VERBS[l] || ROUTE_VERBS.th; return m[route] || m.unknown; }
 
 // Short label shown on the med card; '' for plain oral so cards stay uncluttered.
 const ROUTE_LABELS = {
@@ -303,13 +305,48 @@ const ROUTE_LABELS = {
 };
 function routeLabel(route, l = 'th') { return (ROUTE_LABELS[l] || ROUTE_LABELS.th)[route] || ''; }
 
-// Look up a drug's food relation + administration route from the reference
-// table. Matches an alias exactly (case-insensitive) or fuzzily on the
-// canonical name via pg_trgm similarity. Unknown drugs default to oral /
-// after-meal so a reminder is never blocked. Never throws — falls back on error.
+const REF_ROUTES = new Set(['po','eye_drop','ear_drop','inhaler','nasal','topical','sublingual','injection']);
+const REF_FOODS  = new Set(['before_meal','after_meal','with_food','any']);
+
+// Ask Sonnet to classify a drug we don't have in the curated table. Returns
+// route + food_relation, but ONLY values it is confident about — anything
+// uncertain comes back null so we store a blank rather than a wrong guess
+// (per clinical preference: blank > wrong "after_meal"/"po"). Never throws.
+async function classifyMedWithLLM(name) {
+  try {
+    const r = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 120,
+      system: 'You are a clinical pharmacology assistant for a Thai elderly-care app. Given a medication or product name (Thai or English, possibly a brand or eye-lubricant), classify how it is administered and its meal relation. Reply with ONLY JSON, no prose.',
+      messages: [{ role: 'user', content:
+        `Medication: "${name}"\n\n` +
+        `Return: {"route": <route|null>, "food_relation": <food|null>}\n` +
+        `route ∈ po | eye_drop | ear_drop | inhaler | nasal | topical | sublingual | injection. ` +
+        `po = swallowed tablet/capsule/syrup. Eye lubricants/drops (e.g. Vislube, artificial tears) = eye_drop.\n` +
+        `food_relation ∈ before_meal | after_meal | with_food | any.\n` +
+        `Use null for EITHER field you are not confident about. Do not guess — null is better than a wrong value.` }],
+    });
+    const raw = r.content.find(b => b.type === 'text')?.text || '{}';
+    const m = raw.match(/\{[\s\S]*\}/);
+    const p = m ? JSON.parse(m[0]) : {};
+    const out = {
+      route:         REF_ROUTES.has(p.route) ? p.route : null,
+      food_relation: REF_FOODS.has(p.food_relation) ? p.food_relation : null,
+    };
+    console.log(`🤖 LLM-classified "${name}": route=${out.route ?? '∅'}, food=${out.food_relation ?? '∅'}`);
+    return out;
+  } catch (err) {
+    console.error('classifyMedWithLLM failed:', err.message);
+    return { route: null, food_relation: null };
+  }
+}
+
+// Resolve a drug's food relation + administration route. Curated reference table
+// first (alias match or pg_trgm fuzzy on the canonical name); on a miss, fall
+// back to the LLM classifier. Either field may come back null when unknown — we
+// deliberately do NOT default to 'after_meal'/'po'. Never throws.
 async function lookupMedReference(name) {
-  const fallback = { food_relation: 'after_meal', route: 'po' };
-  if (!name) return fallback;
+  if (!name) return { food_relation: null, route: null };
   try {
     const r = await pool.query(`
       SELECT food_relation, route FROM medications_reference
@@ -318,11 +355,12 @@ async function lookupMedReference(name) {
       ORDER BY similarity(name_canonical, $1) DESC
       LIMIT 1
     `, [name.trim().toLowerCase()]);
-    return r.rows[0] || fallback;
+    if (r.rows[0]) return { food_relation: r.rows[0].food_relation, route: r.rows[0].route };
   } catch (err) {
-    console.error('lookupMedReference failed:', err.message);
-    return fallback;
+    console.error('lookupMedReference table query failed:', err.message);
   }
+  // Not curated → ask the model (which returns null for anything uncertain).
+  return await classifyMedWithLLM(name);
 }
 
 function formatMed(med, l = 'th') {
@@ -331,16 +369,65 @@ function formatMed(med, l = 'th') {
   return `${med.name}${med.dosage ? ` ${med.dosage}` : ''} — ${times}${food ? ` (${food})` : ''}`;
 }
 
-async function saveMedicationToDB(patientId, name, dosage, schedule, source = 'chat') {
-  const { food_relation, route } = await lookupMedReference(name);
+// `ref` ({food_relation, route}) may be passed in when the caller already
+// resolved it (e.g. during the pending-med flow) to avoid a second lookup —
+// otherwise we resolve here. Both fields may be null (unknown), stored as-is.
+async function saveMedicationToDB(patientId, name, dosage, schedule, source = 'chat', ref = null) {
+  const { food_relation = null, route = null } = ref || await lookupMedReference(name);
   const result = await pool.query(
     `INSERT INTO medications (patient_id, name, dosage, schedule, food_relation, route, active, source)
      VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7)
      RETURNING id, name, dosage, schedule, food_relation, route`,
     [patientId, name, dosage, schedule, food_relation, route, source]
   );
-  console.log(`💊 Saved: ${name} @ ${schedule.join(', ')} (${route}, ${food_relation})`);
+  console.log(`💊 Saved: ${name} @ ${schedule.join(', ')} (${route ?? '∅'}, ${food_relation ?? '∅'})`);
   return result.rows[0];
+}
+
+// Per-route phrasing for the "how much each time" question — verb + counting
+// unit so an eye drop asks "หยอดครั้งละกี่หยด" (drops) not "กี่เม็ด" (tablets).
+// Unknown/null route falls back to the oral wording (most meds are pills).
+const MED_DOSE_CFG = {
+  po:         { th: { verb: 'ทาน',    unit: 'เม็ด', half: true }, en: { verb: 'take',     unit: 'tablet', half: true } },
+  sublingual: { th: { verb: 'อม',     unit: 'เม็ด', half: true }, en: { verb: 'dissolve', unit: 'tablet', half: true } },
+  eye_drop:   { th: { verb: 'หยอด',   unit: 'หยด' },              en: { verb: 'use',      unit: 'drop' } },
+  ear_drop:   { th: { verb: 'หยอดหู', unit: 'หยด' },              en: { verb: 'use',      unit: 'drop' } },
+  inhaler:    { th: { verb: 'พ่น',    unit: 'ที' },               en: { verb: 'take',     unit: 'puff' } },
+  nasal:      { th: { verb: 'พ่นจมูก',unit: 'ที' },               en: { verb: 'take',     unit: 'spray' } },
+};
+// Routes where a per-dose count makes no sense (creams, injections) → skip the
+// count question and go straight to timing.
+const NO_COUNT_ROUTES = new Set(['topical', 'injection']);
+
+// Build the route-aware "how many per dose" quick-reply for a pending med.
+function buildDoseQuickReply(l, pm) {
+  const lang2 = l === 'en' ? 'en' : 'th';
+  const cfg = (MED_DOSE_CFG[pm.route] || MED_DOSE_CFG.po)[lang2];
+  const u = cfg.unit;
+  if (lang2 === 'en') {
+    const text = `${pm.name} — how many ${u}s do you ${cfg.verb} each time?\nTap below, or type the number`;
+    const btns = [];
+    if (cfg.half) btns.push({ label: `½ ${u}`, text: `half ${u}` });
+    btns.push({ label: `1 ${u}`, text: `1 ${u}` }, { label: `2 ${u}s`, text: `2 ${u}s` }, { label: '🤔 Not sure', text: 'not sure' });
+    return buildQuickReply(text, btns);
+  }
+  const text = `${pm.name} — ${cfg.verb}ครั้งละกี่${u}ครับ?\nกดเลือกด้านล่าง หรือพิมพ์จำนวนมาได้เลยครับ`;
+  const btns = [];
+  if (cfg.half) btns.push({ label: `½ ${u}`, text: `ครึ่ง${u}` });
+  btns.push({ label: `1 ${u}`, text: `1 ${u}` }, { label: `2 ${u}`, text: `2 ${u}` }, { label: '🤔 ไม่แน่ใจ', text: 'ไม่แน่ใจ' });
+  return buildQuickReply(text, btns);
+}
+
+// After concentration is known/skipped, decide whether to ask a per-dose count
+// (drops/tablets/puffs) or jump to the time question (creams, injections).
+function stageAfterStrength(pm) { return NO_COUNT_ROUTES.has(pm.route) ? 'time' : 'dosage'; }
+
+// The next question to send for a pending med, based on its stage. Centralises
+// wording so the listing flow, photo flow, and advanceOnboarding stay in sync.
+function pendingMedQuestion(l, pm) {
+  if (pm.stage === 'strength') return buildQuickReply(S(l, 'ask_med_strength', pm.name), S(l, 'strength_buttons'));
+  if (pm.stage === 'dosage')   return buildDoseQuickReply(l, pm);
+  return buildQuickReply(S(l, 'ask_med_time', pm.name, pm.dosage), l === 'en' ? TIME_BUTTONS_EN : TIME_BUTTONS);
 }
 
 // ============================================================
@@ -645,6 +732,14 @@ const S = (lang, key, ...args) => {
     ask_med_dose: {
       th: (name) => `${name} — ทานครั้งละกี่เม็ดครับ?\nกดเลือกด้านล่าง หรือพิมพ์จำนวนเม็ดมาได้เลยครับ`,
       en: (name) => `${name} — how many do you take each time?\nTap a button below, or just type the number of tablets`,
+    },
+    ask_med_strength: {
+      th: (name) => `${name} — ขนาด/ความแรงเท่าไหร่ครับ?\nเช่น 5mg, 500mg, 0.5% — ถ้าไม่ทราบกดข้ามได้ครับ`,
+      en: (name) => `${name} — what strength is it?\ne.g. 5mg, 500mg, 0.5% — tap skip if you're not sure`,
+    },
+    strength_buttons: {
+      th: [{ label: '🤔 ไม่ทราบ / ข้าม', text: 'ข้ามความแรง' }],
+      en: [{ label: '🤔 Not sure / skip', text: 'skip strength' }],
     },
     dose_buttons: {
       th: [
@@ -1097,12 +1192,22 @@ function deterministicOnboardingInfo(text, step) {
     if (t === 'หมดแล้ว' || t === 'all done') return { done_listing_meds: true };
   }
 
+  if (step === 'med_strength') {
+    if (t === 'ข้ามความแรง' || t === 'skip strength') return { strength_skip: true };
+    // A strength looks like a number with a unit/percent (5mg, 500 mg, 0.5%, 10ml).
+    if (/^\d+(\.\d+)?\s*(mg|mcg|g|ml|%|มก|มล)\.?$/i.test(t)) return { strength_value: t };
+  }
+
   if (step === 'med_dose') {
     if (t === 'ไม่แน่ใจ' || t === 'ไม่ทราบ' || t === 'not sure') return { dose_answered: true };
-    const DOSE_TEXTS = new Set(['ครึ่งเม็ด', '1 เม็ด', '2 เม็ด', 'half tablet', '1 tablet', '2 tablets']);
+    const DOSE_TEXTS = new Set([
+      'ครึ่งเม็ด', '1 เม็ด', '2 เม็ด', 'half tablet', '1 tablet', '2 tablets',
+      '1 หยด', '2 หยด', 'half drop', '1 drop', '2 drops',
+      '1 ที', '2 ที', '1 puff', '2 puffs', '1 spray', '2 sprays',
+    ]);
     if (DOSE_TEXTS.has(t)) return { dose_count: t };
-    // Free-typed tablet count, e.g. "3", "3 เม็ด", "1.5 เม็ด", "2 tablets".
-    if (/^\d+(\.\d+)?\s*(เม็ด|tablets?|tabs?|pills?)?$/i.test(t)) return { dose_count: t };
+    // Free-typed count, e.g. "3", "3 เม็ด", "1.5 เม็ด", "2 tablets", "1 หยด", "2 ที".
+    if (/^\d+(\.\d+)?\s*(เม็ด|หยด|ที|tablets?|tabs?|pills?|drops?|puffs?|sprays?)?$/i.test(t)) return { dose_count: t };
   }
 
   if (step === 'med_time' && TIME_BUTTON_SCHEDULES[t]) {
@@ -1201,8 +1306,13 @@ function nextStep(profile, medCount = null) {
   if (profile.care_mode === 'family' && !profile.patient_name) return 'patient_name';
   if (profile.conditions === null) return 'conditions';
   if (!profile.meal_times) return 'meal_times';
-  // A named med is waiting: first for its dose (tablets), then for its time.
-  if (profile.pending_med) return profile.pending_med.stage === 'dosage' ? 'med_dose' : 'med_time';
+  // A named med is waiting: concentration (if missing) → per-dose count → time.
+  if (profile.pending_med) {
+    const st = profile.pending_med.stage;
+    if (st === 'strength') return 'med_strength';
+    if (st === 'dosage')   return 'med_dose';
+    return 'med_time';
+  }
   if (!profile.meds_done) return 'medications';
   // If they finished with zero meds, there's nothing to confirm → complete.
   if (medCount === 0) return 'complete';
@@ -2901,12 +3011,14 @@ async function handleInviteToken(lineUserId, token) {
         return { success: false, reason: 'already_linked' };
       }
 
-      // Otherwise it's an empty auto-created shell — retire it so its line_user_id
-      // is freed (UNIQUE) for the placeholder below. (We retire rather than DELETE
-      // to stay safe regardless of FK cascade behaviour; a weekly cleanup cron can
-      // sweep superseded rows later.)
+      // Otherwise it's an empty auto-created shell — free its line_user_id (UNIQUE)
+      // so the placeholder below can take it. We only NULL the id and DON'T change
+      // onboarding_state: the patients_onboarding_state_check CHECK constraint
+      // rejects arbitrary markers like 'superseded', and nothing depends on one —
+      // a row with no line_user_id is already inert. We free rather than DELETE to
+      // stay safe regardless of FK cascade behaviour.
       await dbClient.query(
-        `UPDATE patients SET line_user_id=NULL, onboarding_state='superseded' WHERE id=$1`,
+        `UPDATE patients SET line_user_id=NULL WHERE id=$1`,
         [ex.id]
       );
       shellToClear = ex.id;
