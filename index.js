@@ -3462,6 +3462,7 @@ async function handleTextMessage(event, patientId) {
          pending_med_name=NULL, pending_med_dosage=NULL WHERE id=$1`, [patientId]
       );
       medCache.delete(patientId);
+      clearProfile(patientId);
       await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text',
         text: '🔄 รีเซ็ตบัญชีเรียบร้อยแล้วครับ ส่งข้อความใดก็ได้เพื่อเริ่ม onboarding ใหม่ครับ' }]});
     } catch (err) {
