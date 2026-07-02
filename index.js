@@ -160,6 +160,10 @@ const SYSTEM_PROMPT = `
 // TIME LABELS
 // ============================================================
 
+// Labels for schedule anchors. '08:00'/'12:00'/'18:00'/'21:00' are meal-slot
+// anchors (reminders fire at the patient's personal meal times); '14:00' and
+// '22:00' are fixed clock-time anchors (fire at exactly that time — see
+// getMedicationsDue). Non-anchor "HH:MM" entries display as the raw time.
 const TIME_LABELS = {
   '08:00': 'เช้า', '12:00': 'กลางวัน', '14:00': 'บ่าย',
   '18:00': 'เย็น', '21:00': 'ก่อนนอน', '22:00': 'กลางคืน',
@@ -1278,6 +1282,10 @@ User's latest message: "${text}"`;
 // Validate/normalize a schedule the LLM returned. Keeps only sane values:
 // known anchor slots, or any explicit "HH:MM". Falls back to ['08:00'] when
 // a schedule is required but empty/garbage — never saves an invalid time.
+// '08:00'/'12:00'/'18:00'/'21:00' are meal anchors (fired at the patient's
+// personal meal times); '14:00'/'22:00' have no meal column and fire at the
+// literal clock time via getMedicationsDue's exact-time branch, as does any
+// other exact "HH:MM" this function lets through.
 const ANCHOR_SLOTS = new Set(['08:00','12:00','14:00','18:00','21:00','22:00']);
 function normalizeSchedule(arr) {
   if (!Array.isArray(arr)) return [];
@@ -2252,10 +2260,20 @@ async function getMedicationsDue() {
   const mm = String(bkk.getUTCMinutes()).padStart(2, '0');
   const currentTime = `${hh}:${mm}`;
 
-  // Match current Bangkok time against each patient's personal meal times.
-  // medications.schedule stores slot names ('08:00','12:00','18:00','21:00') as anchors.
-  // We compare the patient's personal times to the current clock time,
-  // then check if the corresponding anchor slot is in the medication's schedule.
+  // medications.schedule holds two kinds of entries:
+  //   1. MEAL ANCHORS '08:00'/'12:00'/'18:00'/'21:00' — symbolic slot names,
+  //      fired at the patient's PERSONAL meal time (meal_morning etc.), not at
+  //      the literal clock time the string spells.
+  //   2. LITERAL TIMES — everything else normalizeSchedule accepts: exact
+  //      "HH:MM" from the extractor (e.g. "8am and 8pm" => '20:00') and the
+  //      fixed anchors '14:00' (บ่าย) / '22:00' (ดึก), which have no personal
+  //      meal column and so fire at that exact clock time.
+  // REGRESSION NOTE: the query originally matched ONLY the 4 meal anchors, so
+  // every literal-time entry (including '14:00'/'22:00') silently never fired.
+  // The last OR branch fixes that. It must keep excluding the 4 meal-anchor
+  // strings: a med anchored to '08:00' whose patient eats at 07:30 fires at
+  // 07:30 via the meal branch, and without the exclusion would fire AGAIN at
+  // literal 08:00.
   const result = await pool.query(
     `SELECT m.id as medication_id, m.name, m.dosage, m.schedule, m.route, m.food_relation,
             p.id as patient_id, p.line_user_id, p.display_name, p.language,
@@ -2266,7 +2284,8 @@ async function getMedicationsDue() {
        ($1 = to_char(p.meal_morning, 'HH24:MI') AND '08:00' = ANY(m.schedule)) OR
        ($1 = to_char(p.meal_midday,  'HH24:MI') AND '12:00' = ANY(m.schedule)) OR
        ($1 = to_char(p.meal_evening, 'HH24:MI') AND '18:00' = ANY(m.schedule)) OR
-       ($1 = to_char(p.meal_bedtime, 'HH24:MI') AND '21:00' = ANY(m.schedule))
+       ($1 = to_char(p.meal_bedtime, 'HH24:MI') AND '21:00' = ANY(m.schedule)) OR
+       ($1 = ANY(m.schedule) AND $1 NOT IN ('08:00','12:00','18:00','21:00'))
      )`,
     [currentTime]
   );
