@@ -75,6 +75,40 @@ pool.query('SELECT NOW()')
   }
 })();
 
+// One-time data migration — medications.schedule slot entries: the legacy
+// meal-anchor strings '08:00'/'12:00'/'18:00'/'21:00' (symbolic, fired at the
+// patient's personal meal times) become the words 'morning'/'midday'/
+// 'evening'/'bedtime'. Unlike the blocks above this MUST NOT re-run: once
+// converted, a literal '08:00' in a schedule is a real clock time (user said
+// "8am") and a second pass would wrongly turn it into 'morning'. Guarded by a
+// marker row in applied_migrations, inside one transaction so the marker and
+// the rewrite land (or fail) together. Mirrored in
+// migrations/003_schedule_slot_words.sql.
+(async () => {
+  const conn = await pool.connect();
+  try {
+    await conn.query(`CREATE TABLE IF NOT EXISTS applied_migrations (
+      name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ DEFAULT NOW())`);
+    await conn.query('BEGIN');
+    const marker = await conn.query(
+      `INSERT INTO applied_migrations (name) VALUES ('003_schedule_slot_words')
+       ON CONFLICT (name) DO NOTHING RETURNING name`);
+    if (marker.rows.length === 0) { await conn.query('ROLLBACK'); return; } // already applied
+    await conn.query(
+      `UPDATE medications SET schedule =
+         array_replace(array_replace(array_replace(array_replace(schedule,
+           '08:00','morning'), '12:00','midday'), '18:00','evening'), '21:00','bedtime')
+       WHERE schedule && ARRAY['08:00','12:00','18:00','21:00']`);
+    await conn.query('COMMIT');
+    console.log('✅ schedule slot-word migration applied');
+  } catch (err) {
+    try { await conn.query('ROLLBACK'); } catch {}
+    console.error('❌ schedule slot-word migration failed:', err.message);
+  } finally {
+    conn.release();
+  }
+})();
+
 // Seed ~common Thai HTN/DM/lipid meds plus a few non-oral examples (eye drops,
 // inhaler) so route handling is exercised. ON CONFLICT DO NOTHING keeps any
 // clinician-edited rows intact across deploys — we only fill gaps, never clobber.
@@ -160,13 +194,13 @@ const SYSTEM_PROMPT = `
 // TIME LABELS
 // ============================================================
 
-// Labels for schedule anchors. '08:00'/'12:00'/'18:00'/'21:00' are meal-slot
-// anchors (reminders fire at the patient's personal meal times); '14:00' and
-// '22:00' are fixed clock-time anchors (fire at exactly that time — see
-// getMedicationsDue). Non-anchor "HH:MM" entries display as the raw time.
+// Display labels for medication schedule entries. Slot words fire at the
+// patient's personal meal times; every other entry is a literal "HH:MM"
+// clock time (see getMedicationsDue) and displays as the raw time, with
+// friendly labels for the common afternoon/late-night cases.
 const TIME_LABELS = {
-  '08:00': 'เช้า', '12:00': 'กลางวัน', '14:00': 'บ่าย',
-  '18:00': 'เย็น', '21:00': 'ก่อนนอน', '22:00': 'กลางคืน',
+  morning: 'เช้า', midday: 'กลางวัน', evening: 'เย็น', bedtime: 'ก่อนนอน',
+  '14:00': 'บ่าย', '22:00': 'กลางคืน',
 };
 
 // ============================================================
@@ -1134,27 +1168,30 @@ Reply with ONLY this JSON (no prose, no markdown):
   "medication": {                              // present ONLY when looks_like_medication is true
     "name": string,                            // drug name, no dose or time words in it
     "dosage": string | null,                   // e.g. "5mg", "500mg", "1 เม็ด", or null if not stated
-    "schedule": string[],                      // anchor times the drug is taken (see ANCHOR TIMES below); [] if no time was given
+    "schedule": string[],                      // when the drug is taken (see SCHEDULE VALUES below); [] if no time was given
     "time_given": boolean                      // true if the message stated WHEN to take it
   } | null,
   "schedule_reply": string[] | null            // when we're waiting for a time and the user replies ONLY with a time
-                                               // (e.g. "morning and evening", "เช้าเย็น"), the anchor times; else null
+                                               // (e.g. "morning and evening", "เช้าเย็น"), the schedule values; else null
 }
 
-ANCHOR TIMES — schedule and schedule_reply MUST use only these exact strings:
-  "08:00" = morning / เช้า / after breakfast
-  "12:00" = midday / noon / lunch / เที่ยง / กลางวัน
-  "14:00" = afternoon / บ่าย
-  "18:00" = evening / dinner / เย็น / โมงเย็น
-  "21:00" = bedtime / night / ก่อนนอน / 3 ทุ่ม
-  "22:00" = late night / ดึก / 4 ทุ่ม
-Map natural phrases to the nearest anchor. Examples:
-  "twice a day, morning and night" => ["08:00","21:00"]
-  "three times a day" / "เช้ากลางวันเย็น" / "3 มื้อ" => ["08:00","12:00","18:00"]
-  "once daily" / "วันละครั้ง" => ["08:00"]
-  "เช้าเย็น" => ["08:00","18:00"]
-  "after every meal" => ["08:00","12:00","18:00"]
-  "8am and 8pm" => ["08:00","20:00"]   // if an exact non-anchor time is given, use that exact "HH:MM"
+SCHEDULE VALUES — each entry in schedule and schedule_reply MUST be one of:
+  "morning" = morning / เช้า / with breakfast
+  "midday"  = midday / noon / lunch / เที่ยง / กลางวัน
+  "evening" = evening / dinner / เย็น / โมงเย็น
+  "bedtime" = bedtime / before sleep / ก่อนนอน / 3 ทุ่ม
+  "HH:MM"   = an exact clock time the user actually states (24-hour)
+Slot words mean "with that meal" — the reminder fires at the user's own meal
+times. An exact "HH:MM" fires at that literal clock time. Map vague day-part
+phrases to slot words; keep explicitly stated clock times as "HH:MM". Examples:
+  "twice a day, morning and night" => ["morning","bedtime"]
+  "three times a day" / "เช้ากลางวันเย็น" / "3 มื้อ" => ["morning","midday","evening"]
+  "once daily" / "วันละครั้ง" => ["morning"]
+  "เช้าเย็น" => ["morning","evening"]
+  "after every meal" => ["morning","midday","evening"]
+  "8am and 8pm" => ["08:00","20:00"]
+  "afternoon" / "บ่าย" => ["14:00"]
+  "late night" / "ดึก" / "4 ทุ่ม" => ["22:00"]
 
 MEAL TIMES — for the "meal_times" object, extract the actual clock time stated for each meal as
 "HH:MM" (24-hour), or null if that meal isn't mentioned. These are exact times, NOT anchor slots.
@@ -1171,7 +1208,7 @@ Guidance:
 - "ผิด/แก้/เปลี่ยน/ไม่ถูก/edit/wrong" => wants_edit true.
 - A drug name (Thai or English), possibly with a dose and/or a time => looks_like_medication true AND fill "medication".
 - If the drug message also says when to take it (e.g. "Metformin 500mg morning"), set medication.time_given=true and fill medication.schedule. If only a name/dose with no time, time_given=false and schedule=[].
-- IMPORTANT: never put dose or time words inside medication.name. "Metformin 500mg morning" => name "Metformin", dosage "500mg", schedule ["08:00"], time_given true.
+- IMPORTANT: never put dose or time words inside medication.name. "Metformin 500mg morning" => name "Metformin", dosage "500mg", schedule ["morning"], time_given true.
 - A single message can fill several fields at once. Fill all that clearly apply.`;
 
 // Fast, deterministic mapping for the FIXED quick-reply button strings. The
@@ -1184,12 +1221,12 @@ const COND_BUTTON_TEXTS = new Set([
   'hypertension', 'diabetes', 'hypertension and diabetes',
 ]);
 const TIME_BUTTON_SCHEDULES = {
-  'เช้า': ['08:00'],            'morning': ['08:00'],
-  'กลางวัน': ['12:00'],         'midday': ['12:00'],
-  'เย็น': ['18:00'],            'evening': ['18:00'],
-  'ก่อนนอน': ['21:00'],         'bedtime': ['21:00'],
-  'เช้าเย็น': ['08:00', '18:00'],            'morning and evening': ['08:00', '18:00'],
-  'เช้ากลางวันเย็น': ['08:00', '12:00', '18:00'], 'morning midday evening': ['08:00', '12:00', '18:00'],
+  'เช้า': ['morning'],          'morning': ['morning'],
+  'กลางวัน': ['midday'],        'midday': ['midday'],
+  'เย็น': ['evening'],          'evening': ['evening'],
+  'ก่อนนอน': ['bedtime'],       'bedtime': ['bedtime'],
+  'เช้าเย็น': ['morning', 'evening'],            'morning and evening': ['morning', 'evening'],
+  'เช้ากลางวันเย็น': ['morning', 'midday', 'evening'], 'morning midday evening': ['morning', 'midday', 'evening'],
 };
 function deterministicOnboardingInfo(text, step) {
   const t = (text || '').trim();
@@ -1280,21 +1317,21 @@ User's latest message: "${text}"`;
 
 // Determine which slot we still need. Returns a step string used both
 // Validate/normalize a schedule the LLM returned. Keeps only sane values:
-// known anchor slots, or any explicit "HH:MM". Falls back to ['08:00'] when
-// a schedule is required but empty/garbage — never saves an invalid time.
-// '08:00'/'12:00'/'18:00'/'21:00' are meal anchors (fired at the patient's
-// personal meal times); '14:00'/'22:00' have no meal column and fire at the
-// literal clock time via getMedicationsDue's exact-time branch, as does any
-// other exact "HH:MM" this function lets through.
-const ANCHOR_SLOTS = new Set(['08:00','12:00','14:00','18:00','21:00','22:00']);
+// meal-slot words ('morning'/'midday'/'evening'/'bedtime' — reminders fire at
+// the patient's personal meal times) or any explicit "HH:MM" (fires at that
+// literal clock time; see getMedicationsDue). Falls back to ['morning'] when
+// a schedule is required but empty/garbage — never saves an invalid value.
+const MEAL_SLOTS = new Set(['morning', 'midday', 'evening', 'bedtime']);
+// Nominal clock times so slot words sort chronologically among literal times.
+const SLOT_SORT_TIME = { morning: '08:00', midday: '12:00', evening: '18:00', bedtime: '21:00' };
 function normalizeSchedule(arr) {
   if (!Array.isArray(arr)) return [];
   const out = [];
   for (let t of arr) {
     if (typeof t !== 'string') continue;
-    t = t.trim();
-    // accept anchor slots and any valid HH:MM (00:00–23:59)
-    if (ANCHOR_SLOTS.has(t)) { if (!out.includes(t)) out.push(t); continue; }
+    t = t.trim().toLowerCase();
+    // accept meal-slot words and any valid HH:MM (00:00–23:59)
+    if (MEAL_SLOTS.has(t)) { if (!out.includes(t)) out.push(t); continue; }
     const m = t.match(/^(\d{1,2}):(\d{2})$/);
     if (m) {
       const h = parseInt(m[1]), min = parseInt(m[2]);
@@ -1303,7 +1340,7 @@ function normalizeSchedule(arr) {
       if (!out.includes(v)) out.push(v);
     }
   }
-  out.sort();
+  out.sort((a, b) => (SLOT_SORT_TIME[a] || a).localeCompare(SLOT_SORT_TIME[b] || b));
   return out;
 }
 
@@ -1548,7 +1585,7 @@ async function handleOnboarding(event, patient) {
           const restated = medFromExtraction(info);
           if (restated && restated.schedule.length > 0) schedule = restated.schedule;
         }
-        const finalSchedule = schedule.length > 0 ? schedule : ['08:00'];
+        const finalSchedule = schedule.length > 0 ? schedule : ['morning'];
         await persistProfile(patientId, profile, lineUserId);
         await finishPendingMed(replyToken, patientId, profile, l, finalSchedule);
         return;
@@ -2261,19 +2298,19 @@ async function getMedicationsDue() {
   const currentTime = `${hh}:${mm}`;
 
   // medications.schedule holds two kinds of entries:
-  //   1. MEAL ANCHORS '08:00'/'12:00'/'18:00'/'21:00' — symbolic slot names,
-  //      fired at the patient's PERSONAL meal time (meal_morning etc.), not at
-  //      the literal clock time the string spells.
-  //   2. LITERAL TIMES — everything else normalizeSchedule accepts: exact
-  //      "HH:MM" from the extractor (e.g. "8am and 8pm" => '20:00') and the
-  //      fixed anchors '14:00' (บ่าย) / '22:00' (ดึก), which have no personal
-  //      meal column and so fire at that exact clock time.
-  // REGRESSION NOTE: the query originally matched ONLY the 4 meal anchors, so
-  // every literal-time entry (including '14:00'/'22:00') silently never fired.
-  // The last OR branch fixes that. It must keep excluding the 4 meal-anchor
-  // strings: a med anchored to '08:00' whose patient eats at 07:30 fires at
-  // 07:30 via the meal branch, and without the exclusion would fire AGAIN at
-  // literal 08:00.
+  //   1. SLOT WORDS 'morning'/'midday'/'evening'/'bedtime' — fired at the
+  //      patient's PERSONAL meal time (meal_morning etc.).
+  //   2. LITERAL "HH:MM" TIMES — fired at exactly that Bangkok clock time
+  //      (e.g. '20:00' from "8pm", '14:00' = บ่าย, '22:00' = ดึก).
+  // REGRESSION NOTES:
+  //   - Literal-time entries originally never fired at all (the query matched
+  //     only meal anchors); the last OR branch is what fires them.
+  //   - Slots used to be stored as the strings '08:00'/'12:00'/'18:00'/'21:00',
+  //     which collided with literal times ("8am" fired at the patient's meal
+  //     time, not 08:00). The one-time boot migration 003_schedule_slot_words
+  //     converted them to words; the two kinds can no longer collide, so the
+  //     literal branch needs no exclusion list and a slot-word med cannot
+  //     double-fire at its nominal clock time.
   const result = await pool.query(
     `SELECT m.id as medication_id, m.name, m.dosage, m.schedule, m.route, m.food_relation,
             p.id as patient_id, p.line_user_id, p.display_name, p.language,
@@ -2281,11 +2318,11 @@ async function getMedicationsDue() {
      FROM medications m JOIN patients p ON p.id=m.patient_id
      WHERE m.active=TRUE AND p.line_user_id IS NOT NULL
      AND (
-       ($1 = to_char(p.meal_morning, 'HH24:MI') AND '08:00' = ANY(m.schedule)) OR
-       ($1 = to_char(p.meal_midday,  'HH24:MI') AND '12:00' = ANY(m.schedule)) OR
-       ($1 = to_char(p.meal_evening, 'HH24:MI') AND '18:00' = ANY(m.schedule)) OR
-       ($1 = to_char(p.meal_bedtime, 'HH24:MI') AND '21:00' = ANY(m.schedule)) OR
-       ($1 = ANY(m.schedule) AND $1 NOT IN ('08:00','12:00','18:00','21:00'))
+       ($1 = to_char(p.meal_morning, 'HH24:MI') AND 'morning' = ANY(m.schedule)) OR
+       ($1 = to_char(p.meal_midday,  'HH24:MI') AND 'midday'  = ANY(m.schedule)) OR
+       ($1 = to_char(p.meal_evening, 'HH24:MI') AND 'evening' = ANY(m.schedule)) OR
+       ($1 = to_char(p.meal_bedtime, 'HH24:MI') AND 'bedtime' = ANY(m.schedule)) OR
+       ($1 = ANY(m.schedule))
      )`,
     [currentTime]
   );
